@@ -5,22 +5,26 @@
 package org.citra.citra_emu.ui.main
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.util.Log
 import android.view.View
 import android.view.ViewGroup.MarginLayoutParams
 import android.view.WindowManager
 import android.view.animation.PathInterpolator
 import android.widget.Toast
 import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContract
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.net.toUri
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
@@ -39,12 +43,15 @@ import androidx.work.OutOfQuotaPolicy
 import androidx.work.WorkManager
 import com.google.android.material.color.MaterialColors
 import com.google.android.material.navigation.NavigationBarView
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.TimeSource
 import kotlinx.coroutines.launch
 import org.citra.citra_emu.BuildConfig
 import org.citra.citra_emu.NativeLibrary
 import org.citra.citra_emu.R
 import org.citra.citra_emu.contracts.OpenFileResultContract
 import org.citra.citra_emu.databinding.ActivityMainBinding
+import org.citra.citra_emu.dialogs.NetPlayDialog
 import org.citra.citra_emu.features.settings.model.Settings
 import org.citra.citra_emu.features.settings.model.SettingsViewModel
 import org.citra.citra_emu.features.settings.ui.SettingsActivity
@@ -58,14 +65,17 @@ import org.citra.citra_emu.utils.CitraDirectoryHelper
 import org.citra.citra_emu.utils.CitraDirectoryUtils
 import org.citra.citra_emu.utils.DirectoryInitialization
 import org.citra.citra_emu.utils.FileBrowserHelper
+import org.citra.citra_emu.utils.FileUtil
 import org.citra.citra_emu.utils.InsetsHelper
-import org.citra.citra_emu.utils.RefreshRateUtil
 import org.citra.citra_emu.utils.PermissionsHandler
+import org.citra.citra_emu.utils.RefreshRateUtil
 import org.citra.citra_emu.utils.ThemeUtil
 import org.citra.citra_emu.viewmodel.GamesViewModel
 import org.citra.citra_emu.viewmodel.HomeViewModel
 
-class MainActivity : AppCompatActivity(), ThemeProvider {
+class MainActivity :
+    AppCompatActivity(),
+    ThemeProvider {
     private lateinit var binding: ActivityMainBinding
 
     private val homeViewModel: HomeViewModel by viewModels()
@@ -74,6 +84,10 @@ class MainActivity : AppCompatActivity(), ThemeProvider {
 
     override var themeId: Int = 0
 
+    companion object {
+        const val KEY_SETUP_CURRENT_PAGE = "SetupCurrentPage"
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         RefreshRateUtil.enforceRefreshRate(this)
 
@@ -81,20 +95,21 @@ class MainActivity : AppCompatActivity(), ThemeProvider {
         CitraDirectoryUtils.attemptAutomaticUpdateDirectory()
         splashScreen.setKeepOnScreenCondition {
             !DirectoryInitialization.areCitraDirectoriesReady() &&
-                    PermissionsHandler.hasWriteAccess(this) &&
-                    !CitraDirectoryUtils.needToUpdateManually()
+                PermissionsHandler.hasWriteAccess(this) &&
+                !CitraDirectoryUtils.needToUpdateManually()
         }
-
 
         if (PermissionsHandler.hasWriteAccess(applicationContext) &&
             DirectoryInitialization.areCitraDirectoriesReady() &&
-            !CitraDirectoryUtils.needToUpdateManually()) {
+            !CitraDirectoryUtils.needToUpdateManually()
+        ) {
             settingsViewModel.settings.loadSettings()
         }
 
-        ThemeUtil.ThemeChangeListener(this)
+        ThemeUtil.themeChangeListener(this)
         ThemeUtil.setTheme(this)
         super.onCreate(savedInstanceState)
+        NativeLibrary.initMultiplayer()
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
@@ -130,13 +145,25 @@ class MainActivity : AppCompatActivity(), ThemeProvider {
             )
         }
 
+        var applicationsClickTimestamp = TimeSource.Monotonic.markNow()
+
         val navHostFragment =
             supportFragmentManager.findFragmentById(R.id.fragment_container) as NavHostFragment
-        setUpNavigation(navHostFragment.navController)
+        setUpNavigation(savedInstanceState, navHostFragment.navController)
         (binding.navigationView as NavigationBarView).setOnItemReselectedListener {
             when (it.itemId) {
-                R.id.gamesFragment -> gamesViewModel.setShouldScrollToTop(true)
+                R.id.gamesFragment -> {
+                    if (applicationsClickTimestamp.elapsedNow() < 300.milliseconds) {
+                        Toast.makeText(this, BuildConfig.VERSION_NAME, Toast.LENGTH_LONG)
+                            .show()
+                    }
+                    applicationsClickTimestamp = TimeSource.Monotonic.markNow()
+
+                    gamesViewModel.setShouldScrollToTop(true)
+                }
+
                 R.id.searchFragment -> gamesViewModel.setSearchFocused(true)
+
                 R.id.homeSettingsFragment -> SettingsActivity.launch(
                     this,
                     SettingsFile.FILE_NAME_CONFIG,
@@ -174,6 +201,15 @@ class MainActivity : AppCompatActivity(), ThemeProvider {
         }
 
         setInsets()
+        NativeLibrary.importQueuedZipPass()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        // Save the user's current game state.
+        outState.putInt(KEY_SETUP_CURRENT_PAGE, homeViewModel.setupCurrentPage)
+
+        // Always call the superclass so it can save the view hierarchy state.
+        super.onSaveInstanceState(outState)
     }
 
     override fun onResume() {
@@ -184,7 +220,13 @@ class MainActivity : AppCompatActivity(), ThemeProvider {
     }
 
     override fun onDestroy() {
+        NetPlayDialog.stopWifiDirect()
         super.onDestroy()
+    }
+
+    fun displayMultiplayerDialog() {
+        val dialog = NetPlayDialog(this)
+        dialog.show()
     }
 
     override fun setTheme(resId: Int) {
@@ -205,7 +247,11 @@ class MainActivity : AppCompatActivity(), ThemeProvider {
                 GrantMissingFilesystemPermissionFragment.newInstance()
                     .show(supportFragmentManager, GrantMissingFilesystemPermissionFragment.TAG)
 
-            if (supportFragmentManager.findFragmentByTag(GrantMissingFilesystemPermissionFragment.TAG) == null) {
+            if (supportFragmentManager.findFragmentByTag(
+                    GrantMissingFilesystemPermissionFragment.TAG
+                ) ==
+                null
+            ) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     if (!Environment.isExternalStorageManager()) {
                         requestMissingFilesystemPermission()
@@ -232,12 +278,14 @@ class MainActivity : AppCompatActivity(), ThemeProvider {
             return
         } else if (CitraDirectoryUtils.needToUpdateManually()) {
             UpdateUserDirectoryDialogFragment.newInstance(this)
-                .show(supportFragmentManager,UpdateUserDirectoryDialogFragment.TAG)
+                .show(supportFragmentManager, UpdateUserDirectoryDialogFragment.TAG)
             return
         }
 
         if (!BuildUtil.isGooglePlayBuild) {
-            if (supportFragmentManager.findFragmentByTag(SelectUserDirectoryDialogFragment.TAG) == null) {
+            if (supportFragmentManager.findFragmentByTag(SelectUserDirectoryDialogFragment.TAG) ==
+                null
+            ) {
                 if (NativeLibrary.getUserDirectory() == "") {
                     SelectUserDirectoryDialogFragment.newInstance(this)
                         .show(supportFragmentManager, SelectUserDirectoryDialogFragment.TAG)
@@ -251,11 +299,12 @@ class MainActivity : AppCompatActivity(), ThemeProvider {
         (binding.navigationView as NavigationBarView).setupWithNavController(navController)
     }
 
-    private fun setUpNavigation(navController: NavController) {
+    private fun setUpNavigation(savedInstanceState: Bundle?, navController: NavController) {
         val firstTimeSetup = PreferenceManager.getDefaultSharedPreferences(applicationContext)
             .getBoolean(Settings.PREF_FIRST_APP_LAUNCH, true)
 
         if (firstTimeSetup && !homeViewModel.navigatedToSetup) {
+            homeViewModel.setupCurrentPage = savedInstanceState?.getInt(KEY_SETUP_CURRENT_PAGE) ?: 0
             navController.navigate(R.id.firstTimeSetupFragment)
             homeViewModel.navigatedToSetup = true
         } else {
@@ -340,34 +389,35 @@ class MainActivity : AppCompatActivity(), ThemeProvider {
         }.start()
     }
 
-    private fun setInsets() =
-        ViewCompat.setOnApplyWindowInsetsListener(
-            binding.root
-        ) { _: View, windowInsets: WindowInsetsCompat ->
-            val insets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
-            val mlpStatusShade = binding.statusBarShade.layoutParams as MarginLayoutParams
-            mlpStatusShade.height = insets.top
-            binding.statusBarShade.layoutParams = mlpStatusShade
+    private fun setInsets() = ViewCompat.setOnApplyWindowInsetsListener(
+        binding.root
+    ) { _: View, windowInsets: WindowInsetsCompat ->
+        val insets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
+        val mlpStatusShade = binding.statusBarShade.layoutParams as MarginLayoutParams
+        mlpStatusShade.height = insets.top
+        binding.statusBarShade.layoutParams = mlpStatusShade
 
-            // The only situation where we care to have a nav bar shade is when it's at the bottom
-            // of the screen where scrolling list elements can go behind it.
-            val mlpNavShade = binding.navigationBarShade.layoutParams as MarginLayoutParams
-            mlpNavShade.height = insets.bottom
-            binding.navigationBarShade.layoutParams = mlpNavShade
+        // The only situation where we care to have a nav bar shade is when it's at the bottom
+        // of the screen where scrolling list elements can go behind it.
+        val mlpNavShade = binding.navigationBarShade.layoutParams as MarginLayoutParams
+        mlpNavShade.height = insets.bottom
+        binding.navigationBarShade.layoutParams = mlpNavShade
 
-            windowInsets
-        }
+        windowInsets
+    }
 
     private fun createOpenCitraDirectoryLauncher(
         permissionsLost: Boolean
     ): ActivityResultLauncher<Uri?> {
-        return registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { result: Uri? ->
+        return registerForActivityResult(
+            ActivityResultContracts.OpenDocumentTree()
+        ) { result: Uri? ->
             if (result == null) {
                 return@registerForActivityResult
             }
 
             if (!BuildUtil.isGooglePlayBuild) {
-                if (NativeLibrary.getUserDirectory(result) == "") {
+                if (NativeLibrary.getNativePath(result) == "") {
                     SelectUserDirectoryDialogFragment.newInstance(
                         this,
                         R.string.invalid_selection,
@@ -384,6 +434,119 @@ class MainActivity : AppCompatActivity(), ThemeProvider {
 
     val openCitraDirectory = createOpenCitraDirectoryLauncher(permissionsLost = false)
     val openCitraDirectoryLostPermission = createOpenCitraDirectoryLauncher(permissionsLost = true)
+
+    class OpenZipContract : ActivityResultContract<Boolean?, Intent?>() {
+        override fun createIntent(context: Context, input: Boolean?): Intent {
+            return Intent(Intent.ACTION_OPEN_DOCUMENT)
+                .setType("application/zip")
+                .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, input)
+        }
+
+        override fun parseResult(resultCode: Int, intent: Intent?): Intent? = intent
+    }
+
+    class SaveZipContract : ActivityResultContract<String, Intent?>() {
+        override fun createIntent(context: Context, input: String): Intent {
+            return Intent(Intent.ACTION_CREATE_DOCUMENT)
+                .setType("application/zip")
+                .putExtra(Intent.EXTRA_TITLE, input)
+        }
+
+        override fun parseResult(resultCode: Int, intent: Intent?): Intent? = intent
+    }
+
+    val zipPassExporter = registerForActivityResult(
+        SaveZipContract()
+    ) { result: Intent? ->
+        if (result == null) {
+            return@registerForActivityResult
+        }
+
+        val uri = result.data ?: return@registerForActivityResult
+
+        Log.e("ZipPass", "Export file $uri")
+
+        FileUtil.deleteDocument(uri.toString())
+        var nativePath = NativeLibrary.getNativePath(uri)
+
+        if(!nativePath.endsWith(".pass.zip")){
+            if(nativePath.endsWith(".zip")){
+                nativePath = "${nativePath.dropLast(4)}.pass.zip"
+            } else if(nativePath.endsWith(".pass")){
+                nativePath = "$nativePath.zip"
+            } else {
+                nativePath = "$nativePath.pass.zip"
+            }
+        }
+
+        runCatching {
+            NativeLibrary.deleteDocument("!$nativePath")
+        }
+
+        val ret = NativeLibrary.exportZipPass(nativePath)
+
+        if(ret < 0){
+            Toast.makeText(applicationContext, R.string.zippass_export_failed, Toast.LENGTH_LONG)
+                .show()
+        }else if(ret == 0){
+            Toast.makeText(applicationContext, R.string.zippass_export_nothing, Toast.LENGTH_LONG)
+                .show()
+        }else{
+            Toast.makeText(applicationContext, R.string.zippass_export_successful, Toast.LENGTH_LONG)
+                .show()
+        }
+    }
+
+    val zipPassImporter = registerForActivityResult(
+        OpenZipContract()
+    ) { result: Intent? ->
+        if (result == null) {
+            return@registerForActivityResult
+        }
+
+        val selectedFiles =
+            FileBrowserHelper.getSelectedFiles(result, applicationContext, listOf(".pass.zip"))
+        if (selectedFiles == null) {
+            Toast.makeText(applicationContext, R.string.zippass_file_not_found, Toast.LENGTH_LONG)
+                .show()
+            return@registerForActivityResult
+        }
+
+        var ret = 0;
+        var err = 0
+
+        for(file in selectedFiles){
+            Log.e("ZipPass", "import file $file")
+
+            val nativePath = NativeLibrary.getNativePath(file.toUri())
+            val res = NativeLibrary.importZipPass(nativePath)
+
+            if(res < -1){
+                when (res){
+                    -2 -> Toast.makeText(applicationContext, "Missing System Files", Toast.LENGTH_LONG).show()
+                    -3 -> Toast.makeText(applicationContext, "Missing LLE Modules", Toast.LENGTH_LONG).show()
+                    else -> Toast.makeText(applicationContext, "ZipPass Unknown Error", Toast.LENGTH_LONG).show()
+                }
+                return@registerForActivityResult
+            }
+
+            if(res > 0) ret++
+            if(res < 0) err++
+        }
+
+        if(err > 0 && ret == 0) ret = -1
+
+        if(ret < 0){
+            Toast.makeText(applicationContext, R.string.zippass_import_failed, Toast.LENGTH_LONG)
+                .show()
+        }else if(ret == 0){
+            Toast.makeText(applicationContext, R.string.zippass_import_nothing, Toast.LENGTH_LONG)
+                .show()
+        }else{
+            Toast.makeText(applicationContext, R.string.zippass_import_successful, Toast.LENGTH_LONG)
+                .show()
+        }
+    }
 
     val ciaFileInstaller = registerForActivityResult(
         OpenFileResultContract()
@@ -402,7 +565,8 @@ class MainActivity : AppCompatActivity(), ThemeProvider {
 
         val workManager = WorkManager.getInstance(applicationContext)
         workManager.enqueueUniqueWork(
-            "installCiaWork", ExistingWorkPolicy.APPEND_OR_REPLACE,
+            "installCiaWork",
+            ExistingWorkPolicy.APPEND_OR_REPLACE,
             OneTimeWorkRequest.Builder(CiaInstallWorker::class.java)
                 .setInputData(
                     Data.Builder().putStringArray("CIA_FILES", selectedFiles)
@@ -411,5 +575,17 @@ class MainActivity : AppCompatActivity(), ThemeProvider {
                 .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                 .build()
         )
+    }
+
+    val setupOpenCitraDirectory = registerForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { result: Uri? ->
+        homeViewModel.selectedCitraDirectory = result
+    }
+
+    val setupGetGamesDirectory = registerForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { result: Uri? ->
+        homeViewModel.selectedGamesDirectory = result
     }
 }

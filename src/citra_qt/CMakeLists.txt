@@ -49,6 +49,9 @@ add_library(citra_qt STATIC EXCLUDE_FROM_ALL
     configuration/configure_layout.cpp
     configuration/configure_layout.h
     configuration/configure_layout.ui
+    configuration/configure_layout_cycle.cpp
+    configuration/configure_layout_cycle.h
+    configuration/configure_layout_cycle.ui
     configuration/configure_dialog.cpp
     configuration/configure_dialog.h
     configuration/configure_general.cpp
@@ -60,6 +63,9 @@ add_library(citra_qt STATIC EXCLUDE_FROM_ALL
     configuration/configure_hotkeys.cpp
     configuration/configure_hotkeys.h
     configuration/configure_hotkeys.ui
+    configuration/configure_hotkeys_controller.cpp
+    configuration/configure_hotkeys_controller.h
+    configuration/configure_hotkeys_controller.ui
     configuration/configure_input.cpp
     configuration/configure_input.h
     configuration/configure_input.ui
@@ -82,9 +88,9 @@ add_library(citra_qt STATIC EXCLUDE_FROM_ALL
     configuration/configure_ui.cpp
     configuration/configure_ui.h
     configuration/configure_ui.ui
-    configuration/configure_web.cpp
-    configuration/configure_web.h
-    configuration/configure_web.ui
+    configuration/configure_network.cpp
+    configuration/configure_network.h
+    configuration/configure_network.ui
     configuration/configure_cheats.cpp
     configuration/configure_cheats.h
     configuration/configure_cheats.ui
@@ -137,6 +143,8 @@ add_library(citra_qt STATIC EXCLUDE_FROM_ALL
     game_list_worker.h
     hotkeys.cpp
     hotkeys.h
+    hotkey_monitor.cpp
+    hotkey_monitor.h
     loading_screen.cpp
     loading_screen.h
     loading_screen.ui
@@ -171,9 +179,12 @@ add_library(citra_qt STATIC EXCLUDE_FROM_ALL
     multiplayer/state.cpp
     multiplayer/state.h
     multiplayer/validation.h
+    notification_led.cpp
+    notification_led.h
     precompiled_headers.h
     qt_image_interface.cpp
     qt_image_interface.h
+    setting_qkeys.h
     uisettings.cpp
     uisettings.h
     user_data_migration.cpp
@@ -184,11 +195,15 @@ add_library(citra_qt STATIC EXCLUDE_FROM_ALL
     util/graphics_device_info.h
     util/sequence_dialog/sequence_dialog.cpp
     util/sequence_dialog/sequence_dialog.h
+    util/sequence_dialog/controller_sequence_dialog.cpp
+    util/sequence_dialog/controller_sequence_dialog.h
     util/spinbox.cpp
     util/spinbox.h
     util/util.cpp
     util/util.h
 )
+
+target_include_directories(citra_qt PUBLIC ${CMAKE_BINARY_DIR}/src)
 
 if (APPLE)
   target_sources(citra_qt PUBLIC
@@ -210,31 +225,45 @@ if (ENABLE_QT_UPDATE_CHECKER)
 endif()
 
 if (ENABLE_QT_TRANSLATION)
-    set(CITRA_QT_LANGUAGES "${PROJECT_SOURCE_DIR}/dist/languages" CACHE PATH "Path to the translation bundle for the Qt frontend")
+    if (EXISTS "${QT_TARGET_PATH}/translations")
+        set(BASE_QT_LANGUAGES "${QT_TARGET_PATH}/translations" CACHE PATH "Path to Qt base translations")
+    else()
+        set(BASE_QT_LANGUAGES "${QT_TARGET_PATH}/share/qt6/translations" CACHE PATH "Path to Qt base translations")
+    endif()
+    set(CITRA_QT_LANGUAGES "${PROJECT_SOURCE_DIR}/dist/languages" CACHE PATH "Path to Citra translations")
     option(GENERATE_QT_TRANSLATION "Generate en.ts as the translation source file" OFF)
 
     # Update source TS file if enabled
     if (GENERATE_QT_TRANSLATION)
         get_target_property(QT_SRCS citra_qt SOURCES)
         get_target_property(QT_INCLUDES citra_qt INCLUDE_DIRECTORIES)
-        qt_add_lupdate(citra_qt TS_FILES ${CITRA_QT_LANGUAGES}/en.ts
+        qt_add_lupdate(
+            LUPDATE_TARGET citra_qt_lupdate
             SOURCES ${QT_SRCS} ${UIS}
+            TS_FILES ${CITRA_QT_LANGUAGES}/en.ts
             INCLUDE_DIRECTORIES ${QT_INCLUDES}
-            NO_GLOBAL_TARGET)
+            NO_GLOBAL_TARGET
+        )
         add_custom_target(translation ALL DEPENDS citra_qt_lupdate)
     endif()
 
-    # Find all TS files except en.ts
-    file(GLOB_RECURSE LANGUAGES_TS ${CITRA_QT_LANGUAGES}/*.ts)
-    list(REMOVE_ITEM LANGUAGES_TS ${CITRA_QT_LANGUAGES}/en.ts)
+    # Find all TS files for Citra translations except en.ts
+    file(GLOB_RECURSE CITRA_LANGUAGES_TS ${CITRA_QT_LANGUAGES}/*.ts)
+    list(REMOVE_ITEM CITRA_LANGUAGES_TS ${CITRA_QT_LANGUAGES}/en.ts)
 
-    # Compile TS files to QM files
-    qt_add_lrelease(citra_qt TS_FILES ${LANGUAGES_TS} NO_GLOBAL_TARGET QM_FILES_OUTPUT_VARIABLE LANGUAGES_QM)
+    # Compile Citra TS files to QM files
+    qt_add_lrelease(citra_qt TS_FILES ${CITRA_LANGUAGES_TS} NO_GLOBAL_TARGET QM_FILES_OUTPUT_VARIABLE CITRA_LANGUAGES_QM)
+
+    # Find all QM files for Qt translations
+    file(GLOB_RECURSE QT_LANGUAGES_QM ${BASE_QT_LANGUAGES}/qtbase_*.qm)
+
+    # Copy base QT QM files into build directory
+    file(COPY ${QT_LANGUAGES_QM} DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
 
     # Build a QRC file from the QM file list
     set(LANGUAGES_QRC ${CMAKE_CURRENT_BINARY_DIR}/languages.qrc)
     file(WRITE ${LANGUAGES_QRC} "<RCC><qresource prefix=\"languages\">\n")
-    foreach (QM ${LANGUAGES_QM})
+    foreach (QM ${QT_LANGUAGES_QM} ${CITRA_LANGUAGES_QM})
         get_filename_component(QM_FILE ${QM} NAME)
         file(APPEND ${LANGUAGES_QRC} "<file>${QM_FILE}</file>\n")
     endforeach (QM)
@@ -268,6 +297,10 @@ create_target_directory_groups(citra_qt)
 target_link_libraries(citra_qt PRIVATE audio_core citra_common citra_core input_common network video_core)
 target_link_libraries(citra_qt PRIVATE Boost::boost nihstro-headers Qt6::Widgets Qt6::Multimedia Qt6::Concurrent)
 target_link_libraries(citra_qt PRIVATE ${PLATFORM_LIBRARIES} Threads::Threads)
+
+if (MINGW)
+    target_link_libraries(citra_qt PRIVATE dwmapi)
+endif()
 
 if (ENABLE_OPENGL)
     target_link_libraries(citra_qt PRIVATE glad)

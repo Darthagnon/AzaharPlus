@@ -84,9 +84,6 @@ public:
     /// Returns an immutable reference to the PICA GPU.
     [[nodiscard]] const Pica::PicaCore& PicaCore() const;
 
-    /// Returns a mutable reference to the pica debugging context.
-    [[nodiscard]] Pica::DebugContext& DebugContext();
-
     /// Returns a mutable reference to the GSP command debugger.
     [[nodiscard]] GraphicsDebugger& Debugger();
 
@@ -95,6 +92,12 @@ public:
     }
 
     void ApplyPerProgramSettings(u64 program_ID);
+
+    /// Recreates the renderer (for GL context reset in libretro)
+    void RecreateRenderer(Frontend::EmuWindow& emu_window, Frontend::EmuWindow* secondary_window);
+
+    /// Releases the renderer (for GL context destroy in libretro)
+    void ReleaseRenderer();
 
 private:
     void SubmitCmdList(u32 index);

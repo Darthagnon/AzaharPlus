@@ -1,5 +1,3 @@
-//FILE MODIFIED BY AzaharPlus APRIL 2025
-
 // Copyright Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
@@ -17,6 +15,9 @@
 #include <ios>
 #include <limits>
 #include <memory>
+#ifdef HAVE_LIBRETRO
+#include <mutex>
+#endif
 #include <optional>
 #include <span>
 #include <string>
@@ -33,8 +34,22 @@
 #ifdef _MSC_VER
 #include "common/string_util.h"
 #endif
+#if defined(ANDROID) && !defined(HAVE_LIBRETRO_VFS)
+#include "android_utils.h"
+#endif
+
+#ifdef HAVE_LIBRETRO_VFS
+#define SKIP_STDIO_REDEFINES
+#include <streams/file_stream_transforms.h>
+#define CORE_FILE RFILE
+#else
+#define CORE_FILE std::FILE
+#endif
 
 namespace FileUtil {
+
+void setProgramId(std::string id);
+std::string getCecId(std::string programId);
 
 // User paths for GetUserPath
 enum class UserPath {
@@ -118,11 +133,13 @@ private:
 // Returns the size of filename (64bit)
 [[nodiscard]] u64 GetSize(const std::string& filename);
 
+time_t GetDate(const std::string& filename);
+
 // Overloaded GetSize, accepts file descriptor
 [[nodiscard]] u64 GetSize(int fd);
 
 // Overloaded GetSize, accepts FILE*
-[[nodiscard]] u64 GetSize(FILE* f);
+[[nodiscard]] u64 GetSize(CORE_FILE* f);
 
 // Returns true if successful, or path already exists.
 bool CreateDir(const std::string& filename);
@@ -391,15 +408,7 @@ public:
     [[nodiscard]] size_t ReadSpan(std::span<T> data) {
         static_assert(std::is_trivially_copyable_v<T>, "Data type must be trivially copyable.");
 
-#ifdef todotodo
         return ReadImpl(data.data(), data.size(), sizeof(T));
-#else
-        if (!IsOpen()) {
-            return 0;
-        }
-
-        return std::fread(data.data(), sizeof(T), data.size(), m_file);
-#endif
     }
 
     /**
@@ -421,16 +430,29 @@ public:
     [[nodiscard]] size_t WriteSpan(std::span<const T> data) {
         static_assert(std::is_trivially_copyable_v<T>, "Data type must be trivially copyable.");
 
-#ifdef todotodo
         return WriteImpl(data.data(), data.size(), sizeof(T));
-#else
-        if (!IsOpen()) {
-            return 0;
-        }
-
-        return std::fwrite(data.data(), sizeof(T), data.size(), m_file);
-#endif
     }
+
+    /**
+     * Reads the file line by line, returning true if data
+     * was read and false when reaching the end of file.
+     *
+     * @param line The output string to write the read data to
+     *
+     * @returns Whether the line was read or not
+     */
+    bool ReadLine(std::string& line);
+
+    /**
+     * Writes the specified line to the file
+     * automatically appending a newline
+     * character to it.
+     *
+     * @param line The input string to write
+     *
+     * @returns Count of bytes written, including the newline.
+     */
+    size_t WriteLine(const std::string_view line);
 
     [[nodiscard]] virtual bool IsOpen() const {
         return nullptr != m_file;
@@ -441,13 +463,20 @@ public:
         return m_good;
     }
     [[nodiscard]] virtual int GetFd() const {
-#ifdef ANDROID
-        return m_fd;
+#ifdef HAVE_LIBRETRO_VFS
+        if (m_file == nullptr)
+            return -1;
+        return fileno(filestream_get_vfs_handle(m_file)->fp);
 #else
+#ifdef ANDROID
+        if (!AndroidUtils::CanUseRawFS()) {
+            return m_fd;
+        }
+#endif // ANDROID
         if (m_file == nullptr)
             return -1;
         return fileno(m_file);
-#endif
+#endif // HAVE_LIBRETRO_VFS
     }
     [[nodiscard]] explicit operator bool() const {
         return IsGood();
@@ -466,7 +495,12 @@ public:
     // clear error state
     virtual void Clear() {
         m_good = true;
+
+#ifdef HAVE_LIBRETRO_VFS
+        filestream_rewind(m_file);
+#else
         std::clearerr(m_file);
+#endif
     }
 
     virtual bool IsCrypto() {
@@ -494,9 +528,16 @@ protected:
     virtual u64 TellImpl() const;
 
 private:
-    std::FILE* m_file = nullptr;
+    CORE_FILE* m_file = nullptr;
     int m_fd = -1;
     bool m_good = true;
+#ifdef HAVE_LIBRETRO_VFS
+    // pread() doesn't touch the file position, so it's safe alongside
+    // concurrent fread/fwrite. Libretro VFS has no pread equivalent, so
+    // ReadAtImpl emulates it with seek+read+seek, which would corrupt the
+    // file position for concurrent Read/Write operations.
+    mutable std::mutex m_file_pos_mutex;
+#endif
 
     std::string filename;
     std::string openmode;

@@ -23,6 +23,7 @@
 #include <QTranslator>
 #include "citra_qt/compatibility_list.h"
 #include "citra_qt/hotkeys.h"
+#include "citra_qt/notification_led.h"
 #include "citra_qt/user_data_migration.h"
 #include "core/core.h"
 #include "core/savestate.h"
@@ -149,14 +150,18 @@ signals:
     void CIAInstallReport(Service::AM::InstallStatus status, QString filepath);
     void CompressFinished(bool is_compress, bool success);
     void CIAInstallFinished();
+    void InfoLEDColorChanged();
     // Signal that tells widgets to update icons to use the current theme
     void UpdateThemedIcons();
+    void InstalledTitlesChanged();
 
 private:
     void InitializeWidgets();
     void InitializeDebugWidgets();
     void InitializeRecentFileMenuActions();
     void InitializeSaveStateMenuActions();
+    void InitializeAmiibos();
+    void UpdateAmiibos();
 
     void SetDefaultUIGeometry();
     void SyncMenuUISettings();
@@ -231,7 +236,7 @@ private:
     void ShowFFmpegErrorMessage();
 
 private slots:
-    void OnStartGame();
+    void OnResumeGame(bool first_start);
     void OnRestartGame();
     void OnPauseGame();
     void OnPauseContinueGame();
@@ -256,16 +261,26 @@ private slots:
     void OnMenuConnectArticBase();
     void OnMenuRemoveAzaharEncryption();
     void OnMenuRevertEncryptionRemoval();
+	void OnMenuLibzipLicence();
+    void OnDownloadSystemFilesMenu(u32 region);
     void OnMenuBootHomeMenu(u32 region);
     void OnUpdateProgress(std::size_t written, std::size_t total);
     void OnCIAInstallReport(Service::AM::InstallStatus status, QString filepath);
     void OnCompressFinished(bool is_compress, bool success);
     void OnCIAInstallFinished();
     void OnMenuRecentFile();
+    void OnPreviousAmiibo();
+    void OnMenuAmiiboAction();
+    void OnMenuAmiiboFileAction();
     void OnConfigure();
+    void OnExportZipPass();
+    void OnImportZipPass();
+    void OnClearStreetPassConfig();
     void OnLoadAmiibo();
     void OnRemoveAmiibo();
     void OnOpenCitraFolder();
+    void OnOpenNANDFolder();
+    void OnOpenSDMCFolder();
     void OnToggleFilterBar();
     void OnDisplayTitleBars(bool);
     void InitializeHotkeys();
@@ -368,6 +383,8 @@ private:
 
     MultiplayerState* multiplayer_state = nullptr;
 
+    LedWidget* notification_led = nullptr;
+
     // Created before `config` to ensure that emu data directory
     // isn't created before the check is performed
     UserDataMigrator user_data_migrator;
@@ -406,23 +423,25 @@ private:
     // Whether game was paused due to stopping video dumping
     bool game_paused_for_dumping = false;
 
+    int gdbport_from_arg = -1;
+
     QString gl_renderer;
     std::vector<QString> physical_devices;
 
     // Debugger panes
-    ProfilerWidget* profilerWidget;
+    ProfilerWidget* profilerWidget{};
 #if MICROPROFILE_ENABLED
-    MicroProfileDialog* microProfileDialog;
+    MicroProfileDialog* microProfileDialog{};
 #endif
-    RegistersWidget* registersWidget;
-    GPUCommandStreamWidget* graphicsWidget;
-    GPUCommandListWidget* graphicsCommandsWidget;
-    GraphicsBreakPointsWidget* graphicsBreakpointsWidget;
-    GraphicsVertexShaderWidget* graphicsVertexShaderWidget;
-    GraphicsTracingWidget* graphicsTracingWidget;
-    IPCRecorderWidget* ipcRecorderWidget;
-    LLEServiceModulesWidget* lleServiceModulesWidget;
-    WaitTreeWidget* waitTreeWidget;
+    RegistersWidget* registersWidget{};
+    GPUCommandStreamWidget* graphicsWidget{};
+    GPUCommandListWidget* graphicsCommandsWidget{};
+    GraphicsBreakPointsWidget* graphicsBreakpointsWidget{};
+    GraphicsVertexShaderWidget* graphicsVertexShaderWidget{};
+    GraphicsTracingWidget* graphicsTracingWidget{};
+    IPCRecorderWidget* ipcRecorderWidget{};
+    LLEServiceModulesWidget* lleServiceModulesWidget{};
+    WaitTreeWidget* waitTreeWidget{};
 
     QAction* actions_recent_files[max_recent_files_item];
     std::array<QAction*, Core::SaveStateSlotCount> actions_load_state;
@@ -439,7 +458,8 @@ private:
     QAction* action_secondary_swap_screen;
     QAction* action_secondary_rotate_screen;
 
-    QTranslator translator;
+    QTranslator qtTranslator;
+    QTranslator citraTranslator;
 
     // stores default icon theme search paths for the platform
     QStringList default_theme_paths;
@@ -465,6 +485,7 @@ protected:
     void mouseMoveEvent(QMouseEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
+    void showEvent(QShowEvent* event) override;
 };
 
 class GApplicationEventFilter : public QObject {

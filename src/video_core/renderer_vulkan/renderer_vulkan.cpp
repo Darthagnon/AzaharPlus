@@ -20,9 +20,11 @@
 #include "video_core/host_shaders/vulkan_present_interlaced_frag.h"
 #include "video_core/host_shaders/vulkan_present_vert.h"
 
-#include <vk_mem_alloc.h>
+#include "video_core/host_shaders/vulkan_cursor_frag.h"
+#include "video_core/host_shaders/vulkan_cursor_vert.h"
 
-#ifdef __APPLE__
+#include <vk_mem_alloc.h>
+#if defined(__APPLE__) && !defined(HAVE_LIBRETRO)
 #include "common/apple_utils.h"
 #endif
 
@@ -60,11 +62,11 @@ constexpr static std::array<vk::DescriptorSetLayoutBinding, 1> PRESENT_BINDINGS 
 
 namespace {
 static bool IsLowRefreshRate() {
+#if (defined(__APPLE__) || defined(ENABLE_SDL2)) && !defined(HAVE_LIBRETRO)
     if (!Settings::values.use_display_refresh_rate_detection) {
         LOG_INFO(Render_Vulkan, "Refresh rate detection is currently disabled via settings");
         return false;
     }
-#if defined(__APPLE__) || defined(ENABLE_SDL2)
 #ifdef __APPLE__
     // Apple's low power mode sometimes limits applications to 30fps without changing the refresh
     // rate, meaning the above code doesn't catch it.
@@ -98,7 +100,7 @@ static bool IsLowRefreshRate() {
         LOG_INFO(Render_Vulkan, "Refresh rate is above emulated 3DS screen: {}hz. Good.",
                  cur_refresh_rate);
     }
-#endif // defined(__APPLE__) || defined(ENABLE_SDL2)
+#endif // (defined(__APPLE__) || defined(ENABLE_SDL2)) && !defined(HAVE_LIBRETRO)
 
     // We have no available method of checking refresh rate. Just assume that everything is fine :)
     return false;
@@ -153,6 +155,10 @@ RendererVulkan::~RendererVulkan() {
         device.destroyImageView(info.texture.image_view);
         vmaDestroyImage(instance.GetAllocator(), info.texture.image, info.texture.allocation);
     }
+
+    device.destroyPipeline(cursor_pipeline);
+    device.destroyShaderModule(cursor_vertex_shader);
+    device.destroyShaderModule(cursor_fragment_shader);
 }
 
 void RendererVulkan::PrepareRendertarget() {
@@ -230,23 +236,29 @@ void RendererVulkan::PrepareDraw(Frame* frame, const Layout::FramebufferLayout& 
 
 void RendererVulkan::RenderToWindow(PresentWindow& window, const Layout::FramebufferLayout& layout,
                                     bool flipped) {
-    Frame* frame = window.GetRenderFrame();
+    if (!Settings::values.use_skip_duplicate_frames.GetValue() ||
+        Core::PerfStats::game_frames_updated) {
+        Frame* frame = window.GetRenderFrame();
 
-    if (layout.width != frame->width || layout.height != frame->height) {
-        window.WaitPresent();
-        scheduler.Finish();
-        window.RecreateFrame(frame, layout.width, layout.height);
+        if (layout.width != frame->width || layout.height != frame->height) {
+            window.WaitPresent();
+            scheduler.Finish();
+            window.RecreateFrame(frame, layout.width, layout.height);
+        }
+
+        clear_color.float32[0] = Settings::values.bg_red.GetValue();
+        clear_color.float32[1] = Settings::values.bg_green.GetValue();
+        clear_color.float32[2] = Settings::values.bg_blue.GetValue();
+        clear_color.float32[3] = 1.0f;
+
+        DrawScreens(frame, layout, flipped);
+        scheduler.Flush(frame->render_ready);
+        window.Present(frame);
+        if ((secondaryWindowEnabled && isSecondaryWindow) || (!secondaryWindowEnabled)) {
+            Core::PerfStats::game_frames_updated = false;
+            screenRendered = true;
+        }
     }
-
-    clear_color.float32[0] = Settings::values.bg_red.GetValue();
-    clear_color.float32[1] = Settings::values.bg_green.GetValue();
-    clear_color.float32[2] = Settings::values.bg_blue.GetValue();
-    clear_color.float32[3] = 1.0f;
-
-    DrawScreens(frame, layout, flipped);
-    scheduler.Flush(frame->render_ready);
-
-    window.Present(frame);
 }
 
 void RendererVulkan::LoadFBToScreenInfo(const Pica::FramebufferConfig& framebuffer,
@@ -294,6 +306,11 @@ void RendererVulkan::CompileShaders() {
     present_shaders[2] = Compile(HostShaders::VULKAN_PRESENT_INTERLACED_FRAG,
                                  vk::ShaderStageFlagBits::eFragment, device, preamble);
 
+    cursor_vertex_shader =
+        Compile(HostShaders::VULKAN_CURSOR_VERT, vk::ShaderStageFlagBits::eVertex, device);
+    cursor_fragment_shader =
+        Compile(HostShaders::VULKAN_CURSOR_FRAG, vk::ShaderStageFlagBits::eFragment, device);
+
     auto properties = instance.GetPhysicalDevice().getProperties();
     for (std::size_t i = 0; i < present_samplers.size(); i++) {
         const vk::Filter filter_mode = i == 0 ? vk::Filter::eLinear : vk::Filter::eNearest;
@@ -330,6 +347,9 @@ void RendererVulkan::BuildLayouts() {
         .pPushConstantRanges = &push_range,
     };
     present_pipeline_layout = instance.GetDevice().createPipelineLayoutUnique(layout_info);
+
+    const vk::PipelineLayoutCreateInfo cursor_layout_info = {};
+    cursor_pipeline_layout = instance.GetDevice().createPipelineLayoutUnique(cursor_layout_info);
 }
 
 void RendererVulkan::BuildPipelines() {
@@ -460,6 +480,126 @@ void RendererVulkan::BuildPipelines() {
         ASSERT_MSG(result == vk::Result::eSuccess, "Unable to build present pipelines");
         present_pipelines[i] = pipeline;
     }
+
+    // Build cursor pipeline (simple position-only, inverted color blending)
+    {
+        const vk::VertexInputBindingDescription cursor_binding = {
+            .binding = 0,
+            .stride = sizeof(float) * 2,
+            .inputRate = vk::VertexInputRate::eVertex,
+        };
+
+        const vk::VertexInputAttributeDescription cursor_attribute = {
+            .location = 0,
+            .binding = 0,
+            .format = vk::Format::eR32G32Sfloat,
+            .offset = 0,
+        };
+
+        const vk::PipelineVertexInputStateCreateInfo cursor_vertex_input = {
+            .vertexBindingDescriptionCount = 1,
+            .pVertexBindingDescriptions = &cursor_binding,
+            .vertexAttributeDescriptionCount = 1,
+            .pVertexAttributeDescriptions = &cursor_attribute,
+        };
+
+        const vk::PipelineInputAssemblyStateCreateInfo cursor_input_assembly = {
+            .topology = vk::PrimitiveTopology::eTriangleList,
+            .primitiveRestartEnable = false,
+        };
+
+        const vk::PipelineRasterizationStateCreateInfo cursor_raster = {
+            .depthClampEnable = false,
+            .rasterizerDiscardEnable = false,
+            .cullMode = vk::CullModeFlagBits::eNone,
+            .frontFace = vk::FrontFace::eClockwise,
+            .depthBiasEnable = false,
+            .lineWidth = 1.0f,
+        };
+
+        const vk::PipelineMultisampleStateCreateInfo cursor_multisample = {
+            .rasterizationSamples = vk::SampleCountFlagBits::e1,
+            .sampleShadingEnable = false,
+        };
+
+        const vk::PipelineColorBlendAttachmentState cursor_blend_attachment = {
+            .blendEnable = true,
+            .srcColorBlendFactor = vk::BlendFactor::eOneMinusDstColor,
+            .dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcColor,
+            .colorBlendOp = vk::BlendOp::eAdd,
+            .srcAlphaBlendFactor = vk::BlendFactor::eOne,
+            .dstAlphaBlendFactor = vk::BlendFactor::eZero,
+            .alphaBlendOp = vk::BlendOp::eAdd,
+            .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                              vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
+        };
+
+        const vk::PipelineColorBlendStateCreateInfo cursor_color_blending = {
+            .logicOpEnable = false,
+            .attachmentCount = 1,
+            .pAttachments = &cursor_blend_attachment,
+        };
+
+        const vk::Viewport placeholder_vp = {0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f};
+        const vk::Rect2D placeholder_sc = {{0, 0}, {1, 1}};
+        const vk::PipelineViewportStateCreateInfo cursor_viewport = {
+            .viewportCount = 1,
+            .pViewports = &placeholder_vp,
+            .scissorCount = 1,
+            .pScissors = &placeholder_sc,
+        };
+
+        const std::array cursor_dynamic_states = {
+            vk::DynamicState::eViewport,
+            vk::DynamicState::eScissor,
+        };
+
+        const vk::PipelineDynamicStateCreateInfo cursor_dynamic = {
+            .dynamicStateCount = static_cast<u32>(cursor_dynamic_states.size()),
+            .pDynamicStates = cursor_dynamic_states.data(),
+        };
+
+        const vk::PipelineDepthStencilStateCreateInfo cursor_depth = {
+            .depthTestEnable = false,
+            .depthWriteEnable = false,
+            .depthCompareOp = vk::CompareOp::eAlways,
+            .depthBoundsTestEnable = false,
+            .stencilTestEnable = false,
+        };
+
+        const std::array cursor_shader_stages = {
+            vk::PipelineShaderStageCreateInfo{
+                .stage = vk::ShaderStageFlagBits::eVertex,
+                .module = cursor_vertex_shader,
+                .pName = "main",
+            },
+            vk::PipelineShaderStageCreateInfo{
+                .stage = vk::ShaderStageFlagBits::eFragment,
+                .module = cursor_fragment_shader,
+                .pName = "main",
+            },
+        };
+
+        const vk::GraphicsPipelineCreateInfo cursor_pipeline_info = {
+            .stageCount = static_cast<u32>(cursor_shader_stages.size()),
+            .pStages = cursor_shader_stages.data(),
+            .pVertexInputState = &cursor_vertex_input,
+            .pInputAssemblyState = &cursor_input_assembly,
+            .pViewportState = &cursor_viewport,
+            .pRasterizationState = &cursor_raster,
+            .pMultisampleState = &cursor_multisample,
+            .pDepthStencilState = &cursor_depth,
+            .pColorBlendState = &cursor_color_blending,
+            .pDynamicState = &cursor_dynamic,
+            .layout = *cursor_pipeline_layout,
+            .renderPass = main_present_window.Renderpass(),
+        };
+
+        const auto [result, pipeline] =
+            instance.GetDevice().createGraphicsPipeline({}, cursor_pipeline_info);
+        ASSERT_MSG(result == vk::Result::eSuccess, "Unable to build cursor pipeline");
+        cursor_pipeline = pipeline;
+    }
 }
 
 void RendererVulkan::ConfigureFramebufferTexture(TextureInfo& texture,
@@ -525,6 +665,11 @@ void RendererVulkan::ConfigureFramebufferTexture(TextureInfo& texture,
 }
 
 void RendererVulkan::FillScreen(Common::Vec3<u8> color, const TextureInfo& texture) {
+    // When loading some 3GX extensions, FillScreen may be called before texture image is available
+    if (!texture.image) {
+        return;
+    }
+
     const vk::ClearColorValue clear_color = {
         .float32 =
             std::array{
@@ -902,21 +1047,102 @@ void RendererVulkan::DrawScreens(Frame* frame, const Layout::FramebufferLayout& 
 
     if (layout.additional_screen_enabled) {
         const auto& additional_screen = layout.additional_screen;
-        if (!Settings::values.swap_screen.GetValue()) {
+        if (!layout.additional_screen_is_bottom) {
             DrawTopScreen(layout, additional_screen);
         } else {
             DrawBottomScreen(layout, additional_screen);
         }
     }
 
+    DrawCursor(layout);
+
     scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRenderPass(); });
+}
+
+void RendererVulkan::DrawCursor(const Layout::FramebufferLayout& layout) {
+    const auto cursor = render_window.GetCursorInfo();
+    if (!cursor.visible) {
+        return;
+    }
+
+    const float buf_w = static_cast<float>(layout.width);
+    const float buf_h = static_cast<float>(layout.height);
+
+    // Convert from bottom-screen-local to layout-absolute, then to NDC
+    const float abs_x = layout.bottom_screen.left + cursor.projected_x;
+    const float abs_y = layout.bottom_screen.top + cursor.projected_y;
+    const float cx = (abs_x / buf_w) * 2.0f - 1.0f;
+    const float cy = (abs_y / buf_h) * 2.0f - 1.0f;
+    const float ratio = static_cast<float>(layout.bottom_screen.GetHeight()) / 30.0f;
+    const float rw = ratio / buf_w;
+    const float rh = ratio / buf_h;
+
+    // Bottom screen bounds in NDC
+    const float bl = (layout.bottom_screen.left / buf_w) * 2.0f - 1.0f;
+    const float bt = (layout.bottom_screen.top / buf_h) * 2.0f - 1.0f;
+    const float br = (layout.bottom_screen.right / buf_w) * 2.0f - 1.0f;
+    const float bb = (layout.bottom_screen.bottom / buf_h) * 2.0f - 1.0f;
+
+    // Crosshair geometry clamped to bottom screen bounds
+    const float vl = std::fmax(cx - rw / 5.0f, bl);
+    const float vr = std::fmin(cx + rw / 5.0f, br);
+    const float vt = std::fmax(cy - rh, bt);
+    const float vb = std::fmin(cy + rh, bb);
+
+    const float hl = std::fmax(cx - rw, bl);
+    const float hr = std::fmin(cx + rw, br);
+    const float ht = std::fmax(cy - rh / 5.0f, bt);
+    const float hb = std::fmin(cy + rh / 5.0f, bb);
+
+    // 12 vertices = 4 triangles (2 for vertical bar, 2 for horizontal bar)
+    // clang-format off
+    const float vertices[] = {
+        // Vertical bar
+        vl, vt,  vr, vt,  vr, vb,
+        vl, vt,  vr, vb,  vl, vb,
+        // Horizontal bar
+        hl, ht,  hr, ht,  hr, hb,
+        hl, ht,  hr, hb,  hl, hb,
+    };
+    // clang-format on
+
+    const u64 size = sizeof(vertices);
+    auto [data, offset, invalidate] = vertex_buffer.Map(size, 16);
+    std::memcpy(data, vertices, size);
+    vertex_buffer.Commit(size);
+
+    scheduler.Record([this, offset = offset, pipeline = cursor_pipeline](vk::CommandBuffer cmdbuf) {
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+        cmdbuf.bindVertexBuffers(0, vertex_buffer.Handle(), {0});
+        const u32 first_vertex = static_cast<u32>(offset) / (sizeof(float) * 2);
+        cmdbuf.draw(12, 1, first_vertex, 0);
+    });
 }
 
 void RendererVulkan::SwapBuffers() {
     system.perf_stats->StartSwap();
+    screenRendered = false;
+#ifndef ANDROID
+    if (Settings::values.layout_option.GetValue() == Settings::LayoutOption::SeparateWindows) {
+        ASSERT(secondary_window);
+        secondaryWindowEnabled = true;
+    } else {
+        secondaryWindowEnabled = false;
+    }
+#endif
+
+#ifdef ANDROID
+    if (secondary_window) {
+        secondaryWindowEnabled = true;
+    } else {
+        secondaryWindowEnabled = false;
+    }
+#endif
+
     const Layout::FramebufferLayout& layout = render_window.GetFramebufferLayout();
     PrepareRendertarget();
     RenderScreenshot();
+    isSecondaryWindow = false;
     RenderToWindow(main_present_window, layout, false);
 #ifndef ANDROID
     if (Settings::values.layout_option.GetValue() == Settings::LayoutOption::SeparateWindows) {
@@ -926,6 +1152,7 @@ void RendererVulkan::SwapBuffers() {
             secondary_present_window_ptr = std::make_unique<PresentWindow>(
                 *secondary_window, instance, scheduler, IsLowRefreshRate());
         }
+        isSecondaryWindow = true;
         RenderToWindow(*secondary_present_window_ptr, secondary_layout, false);
         secondary_window->PollEvents();
     }
@@ -938,10 +1165,14 @@ void RendererVulkan::SwapBuffers() {
             secondary_present_window_ptr = std::make_unique<PresentWindow>(
                 *secondary_window, instance, scheduler, IsLowRefreshRate());
         }
+        isSecondaryWindow = true;
         RenderToWindow(*secondary_present_window_ptr, secondary_layout, false);
         secondary_window->PollEvents();
     }
 #endif
+    if (!screenRendered) {
+        scheduler.Finish();
+    }
 
     system.perf_stats->EndSwap();
     rasterizer.TickFrame();
@@ -1070,6 +1301,15 @@ void RendererVulkan::RenderScreenshotWithStagingCopy() {
 
     // Copy backing image data to the QImage screenshot buffer
     std::memcpy(settings.screenshot_bits, alloc_info.pMappedData, staging_buffer_info.size);
+
+    // QImage::Format_RGB32 expects BGRA byte order. If the swapchain format is RGBA,
+    // swap R and B channels so the screenshot colors are correct.
+    if (main_present_window.GetSurfaceFormat() == vk::Format::eR8G8B8A8Unorm) {
+        u8* pixels = static_cast<u8*>(settings.screenshot_bits);
+        for (u32 i = 0; i < width * height; i++) {
+            std::swap(pixels[i * 4 + 0], pixels[i * 4 + 2]);
+        }
+    }
 
     // Destroy allocated resources
     vmaDestroyBuffer(instance.GetAllocator(), staging_buffer, allocation);
@@ -1225,6 +1465,15 @@ bool RendererVulkan::TryRenderScreenshotWithHostMemory() {
 
     // Ensure the copy is fully completed before saving the screenshot
     scheduler.Finish();
+
+    // QImage::Format_RGB32 expects BGRA byte order. If the swapchain format is RGBA,
+    // swap R and B channels so the screenshot colors are correct.
+    if (main_present_window.GetSurfaceFormat() == vk::Format::eR8G8B8A8Unorm) {
+        u8* pixels = static_cast<u8*>(settings.screenshot_bits);
+        for (u32 i = 0; i < width * height; i++) {
+            std::swap(pixels[i * 4 + 0], pixels[i * 4 + 2]);
+        }
+    }
 
     // Image data has been copied directly to host memory
     device.destroyFramebuffer(frame.framebuffer);

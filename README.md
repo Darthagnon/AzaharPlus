@@ -5,6 +5,10 @@ Each version is the same as the corresponding version of Azahar exept for this:
 - Ability to download system files from official servers. No need for an actual 3DS.
 - Compatibility with older CPUs (no SSE4.2 required)
 - Compatibility with Android 9
+- ZipPass: A new way to exchange StreetPass data through zip files
+- Built in cheats
+- Amiibo generation
+- Better multiplayer compatibility with other Citra forks
 
 The Azahar logo is the property of PabloMK7 and angyartanddraw
 ---
@@ -17,27 +21,42 @@ The Azahar logo is the property of PabloMK7 and angyartanddraw
 
 # Installation
 
-### Windows
-
 Download the latest release from [Releases](https://github.com/AzaharPlus/AzaharPlus/releases).
-
----
 
 ### Android
 
-You can install the app using Obtainium:
-1. Download and install Obtainium from [here](https://github.com/ImranR98/Obtainium/releases) (use the file named `app-release.apk`)
-2. Open Obtainium and click 'Add App'
-3. Type `https://github.com/AzaharPlus/AzaharPlus` into the 'App Source URL' section
-4. Click 'Add'
-5. Click 'Install'
+The Android build is available in 2 flavors.
 
-If you wish, you can also simply install the latest APK from the [Releases](https://github.com/AzaharPlus/AzaharPlus/releases) page.
+- Replace: It has the same application id as Azahar, so it will replace it on the device.
+Its display name is "AzaharPlus" and its icon background is blue.
+Use this one if you have other apps that target Azahar, like a frontend for example.
 
----
-### Linux
+- Coexist: It has a new application id so it can coexist with Azahar without issues.
+Its display name is "+AzaharPlus+" and its icon background is red.
 
-It is available as an AppImage on the [Releases](https://github.com/AzaharPlus/AzaharPlus/releases) page.
+### Cocoon
+
+The easiest way to use AzaharPlus with Cocoon is to uninstall Azahar and install the replace variant of AzaharPlus. It wiil be seen as Azahar by Cocoon.
+
+### Batocera
+
+To use AzaharPlus with Batocera you can install the Batocera Unofficial Add-ons
+
+ https://github.com/batocera-unofficial-addons/batocera-unofficial-addons
+
+# ZipPass
+
+ZipPass allows you to share StreetPass data in the form of zip files.<br>
+On desktop it is in File > ZipPass. On android it is in the main menu.
+
+- It can only be used when no game is running.
+- It requires system files and LLE modules enabled.
+- You need to enable StreetPass in your games.
+- The export feature will save the StreetPass data of all your games in a xxx.pass.zip file.
+- The import feature lets you pick one or several xxx.pass.zip files and will simulate StreetPass tags.
+- You can pick as many files as you want for the import but every game has a limit for its queue and anything - beyond that will be ignored.
+- This is all pretty experimental so in case of issues, I added a menu to disable StreetPass on every game. You won't lose anything, you will simply need to enable StreetPass again.
+- I opened a topic on the github for people to share their data: [ZipPass Exchange](https://github.com/AzaharPlus/AzaharPlus/discussions/117)
 
 # Build instructions
 
@@ -60,3 +79,7 @@ CPU: Snapdragon 835 SoC or better
 GPU: OpenGL ES 3.2 or Vulkan 1.1 support
 Memory: 2GB of RAM. 4GB is recommended
 ```
+
+# Where to find this project
+- Github: https://github.com/AzaharPlus/AzaharPlus
+- Radicle: [rad:z3A98CGFJYqHnttims4N7jYNzRoDu](https://radicle.network/nodes/rosa.radicle.network/rad%3Az3A98CGFJYqHnttims4N7jYNzRoDu)

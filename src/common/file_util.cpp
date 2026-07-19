@@ -43,6 +43,12 @@
 #define fseeko _fseeki64
 #define ftello _ftelli64
 #define fileno _fileno
+typedef struct _stat64 file_stat_t;
+#define fstat _fstat64
+#elif defined(HAVE_LIBRETRO)
+typedef struct _stat64 file_stat_t;
+#else
+typedef struct stat file_stat_t;
 #endif
 
 #else
@@ -56,6 +62,7 @@
 #include <dirent.h>
 #include <pwd.h>
 #include <unistd.h>
+typedef struct stat file_stat_t;
 #endif
 
 #if defined(__APPLE__)
@@ -75,8 +82,8 @@
 
 #endif
 
-#ifdef ANDROID
-#include "common/android_storage.h"
+#if defined(ANDROID) && !defined(HAVE_LIBRETRO_VFS)
+#include "common/android_utils.h"
 #include "common/string_util.h"
 #endif
 
@@ -85,6 +92,46 @@
 
 #ifndef S_ISDIR
 #define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
+#endif
+
+#ifdef HAVE_LIBRETRO_VFS
+#define SKIP_STDIO_REDEFINES
+#include <streams/file_stream.h>
+#include <streams/file_stream_transforms.h>
+
+#define FILE RFILE
+#define FTELL rftell
+#define FOPEN rfopen
+#define FCLOSE rfclose
+#define FSEEK rfseek
+#define FREAD rfread
+#define FWRITE rfwrite
+#define FEOF rfeof
+#define FERROR rferror
+#define FFLUSH rfflush
+
+#else
+
+#define FTELL ftello
+#define FOPEN fopen
+#define FCLOSE std::fclose
+#define FSEEK fseeko
+#define FREAD std::fread
+#define FWRITE std::fwrite
+#define FEOF feof
+#define FERROR ferror
+#define FFLUSH std::fflush
+
+#ifdef _MSC_VER
+#define DUP_FD _dup
+#define FDOPEN _fdopen
+#define CLOSE_FD _close
+#else
+#define DUP_FD dup
+#define FDOPEN fdopen
+#define CLOSE_FD close
+#endif
+
 #endif
 
 // This namespace has various generic functions related to files and paths.
@@ -119,8 +166,14 @@ bool Exists(const std::string& filename) {
         copy += DIR_SEP_CHR;
 
     int result = _wstat64(Common::UTF8ToUTF16W(copy).c_str(), &file_info);
-#elif ANDROID
-    int result = AndroidStorage::FileExists(filename) ? 0 : -1;
+#elif defined(ANDROID) && !defined(HAVE_LIBRETRO_VFS)
+    int result;
+    if (AndroidUtils::CanUseRawFS()) {
+        struct stat file_info;
+        result = stat(AndroidUtils::TranslateFilePath(copy).c_str(), &file_info);
+    } else {
+        result = AndroidUtils::FileExists(filename) ? 0 : -1;
+    }
 #else
     struct stat file_info;
     int result = stat(copy.c_str(), &file_info);
@@ -130,9 +183,6 @@ bool Exists(const std::string& filename) {
 }
 
 bool IsDirectory(const std::string& filename) {
-#ifdef ANDROID
-    return AndroidStorage::IsDirectory(filename);
-#endif
 
     std::string copy(filename);
     StripTailDirSlashes(copy);
@@ -144,6 +194,14 @@ bool IsDirectory(const std::string& filename) {
         copy += DIR_SEP_CHR;
 
     int result = _wstat64(Common::UTF8ToUTF16W(copy).c_str(), &file_info);
+#elif defined(ANDROID) && !defined(HAVE_LIBRETRO_VFS)
+    struct stat file_info;
+    int result;
+    if (AndroidUtils::CanUseRawFS()) {
+        result = stat(AndroidUtils::TranslateFilePath(copy).c_str(), &file_info);
+    } else {
+        return AndroidUtils::IsDirectory(filename);
+    }
 #else
     struct stat file_info;
     int result = stat(copy.c_str(), &file_info);
@@ -157,35 +215,65 @@ bool IsDirectory(const std::string& filename) {
     return S_ISDIR(file_info.st_mode);
 }
 
-bool Delete(const std::string& filename) {
-    LOG_TRACE(Common_Filesystem, "file {}", filename);
+bool Delete(const std::string& filepath) {
+    LOG_TRACE(Common_Filesystem, "file {}", filepath);
 
     // Return true because we care about the file no
     // being there, not the actual delete.
-    if (!Exists(filename)) {
-        LOG_DEBUG(Common_Filesystem, "{} does not exist", filename);
+    if (!Exists(filepath)) {
+        LOG_DEBUG(Common_Filesystem, "{} does not exist", filepath);
         return true;
     }
 
     // We can't delete a directory
-    if (IsDirectory(filename)) {
-        LOG_ERROR(Common_Filesystem, "Failed: {} is a directory", filename);
+    if (IsDirectory(filepath)) {
+        LOG_ERROR(Common_Filesystem, "Failed: {} is a directory", filepath);
         return false;
     }
 
 #ifdef _WIN32
-    if (!DeleteFileW(Common::UTF8ToUTF16W(filename).c_str())) {
-        LOG_ERROR(Common_Filesystem, "DeleteFile failed on {}: {}", filename, GetLastErrorMsg());
-        return false;
+    // On windows, if we delete a file with an open handle (pending to be deleted) and
+    // then try to open the same file name again, it will fail. On linux this doesn't happen
+    // as the new file will be a different inode, even if it has the same file name.
+    // The 3ds is linux-like, so to emulate this behaviour we need to rename the file
+    // first to an unique name then mark it for deletion. This way we can open new files
+    // with the same name. Once all handles of the old file are closed, the old file will be
+    // finally deleted.
+    static std::atomic<uint64_t> counter{0};
+
+    const std::wstring wfilepath = Common::UTF8ToUTF16W(filepath);
+    const DWORD pid = GetCurrentProcessId();
+    const uint64_t id = counter++;
+
+    std::wstring deleted_path =
+        wfilepath + L".deleted." + std::to_wstring(pid) + L"." + std::to_wstring(id);
+
+    // Rename first
+    if (MoveFileExW(wfilepath.c_str(), deleted_path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        // Then mark file for deletion
+        DeleteFileW(deleted_path.c_str());
+        return true;
     }
-#elif ANDROID
-    if (!AndroidStorage::DeleteDocument(filename)) {
-        LOG_ERROR(Common_Filesystem, "unlink failed on {}", filename);
-        return false;
+
+    LOG_ERROR(Common_Filesystem, "Rename to deleted path failed on {}: {}", filepath,
+              GetLastErrorMsg());
+
+    return false;
+#elif defined(ANDROID) && !defined(HAVE_LIBRETRO_VFS)
+    if (AndroidUtils::CanUseRawFS()) {
+        if (unlink(AndroidUtils::TranslateFilePath(filepath).c_str()) == -1) {
+            LOG_ERROR(Common_Filesystem, "unlink failed on {}: {}", filepath, GetLastErrorMsg());
+            return false;
+        }
+    } else {
+        if (!AndroidUtils::DeleteDocument(filepath)) {
+            LOG_ERROR(Common_Filesystem, "unlink failed on {}", filepath);
+            return false;
+        }
     }
 #else
-    if (unlink(filename.c_str()) == -1) {
-        LOG_ERROR(Common_Filesystem, "unlink failed on {}: {}", filename, GetLastErrorMsg());
+    if (unlink(filepath.c_str()) == -1) {
+        LOG_ERROR(Common_Filesystem, "unlink failed on {}: {}", filepath, GetLastErrorMsg());
         return false;
     }
 #endif
@@ -205,24 +293,40 @@ bool CreateDir(const std::string& path) {
     }
     LOG_ERROR(Common_Filesystem, "CreateDirectory failed on {}: {}", path, error);
     return false;
-#elif ANDROID
-    std::string directory = path;
-    std::string filename = path;
-    if (Common::EndsWith(path, "/")) {
-        directory = GetParentPath(path);
-        filename = GetParentPath(path);
-    }
-    directory = GetParentPath(directory);
-    filename = GetFilename(filename);
-    // If directory path is empty, set it to root.
-    if (directory.empty()) {
-        directory = "/";
-    }
-    if (!AndroidStorage::CreateDir(directory, filename)) {
-        LOG_ERROR(Common_Filesystem, "mkdir failed on {}", path);
+#elif defined(ANDROID) && !defined(HAVE_LIBRETRO_VFS)
+    if (AndroidUtils::CanUseRawFS()) {
+        if (mkdir(AndroidUtils::TranslateFilePath(path).c_str(), 0755) == 0)
+            return true;
+
+        int err = errno;
+
+        if (err == EEXIST) {
+            LOG_DEBUG(Common_Filesystem, "mkdir failed on {}: already exists", path);
+            return true;
+        }
+
+        LOG_ERROR(Common_Filesystem, "mkdir failed on {}: {}", path, strerror(err));
         return false;
-    };
-    return true;
+    } else {
+        std::string directory = path;
+        std::string filename = path;
+        if (Common::EndsWith(path, "/")) {
+            directory = GetParentPath(path);
+            filename = GetParentPath(path);
+        }
+        directory = GetParentPath(directory);
+        filename = GetFilename(filename);
+        // If directory path is empty, set it to root.
+        if (directory.empty()) {
+            directory = "/";
+        }
+        if (!AndroidUtils::CreateDir(directory, filename)) {
+            LOG_ERROR(Common_Filesystem, "mkdir failed on {}", path);
+            return false;
+        };
+        return true;
+    }
+
 #else
     if (mkdir(path.c_str(), 0755) == 0)
         return true;
@@ -292,9 +396,14 @@ bool DeleteDir(const std::string& filename) {
 #ifdef _WIN32
     if (::RemoveDirectoryW(Common::UTF8ToUTF16W(filename).c_str()))
         return true;
-#elif ANDROID
-    if (AndroidStorage::DeleteDocument(filename))
-        return true;
+#elif defined(ANDROID) && !defined(HAVE_LIBRETRO_VFS)
+    if (AndroidUtils::CanUseRawFS()) {
+        if (rmdir(AndroidUtils::TranslateFilePath(filename).c_str()) == 0)
+            return true;
+    } else {
+        if (AndroidUtils::DeleteDocument(filename))
+            return true;
+    }
 #else
     if (rmdir(filename.c_str()) == 0)
         return true;
@@ -307,20 +416,18 @@ bool DeleteDir(const std::string& filename) {
 bool Rename(const std::string& srcFullPath, const std::string& destFullPath) {
     LOG_TRACE(Common_Filesystem, "{} --> {}", srcFullPath, destFullPath);
 #ifdef _WIN32
-    if (_wrename(Common::UTF8ToUTF16W(srcFullPath).c_str(),
-                 Common::UTF8ToUTF16W(destFullPath).c_str()) == 0)
+    if (MoveFileExW(Common::UTF8ToUTF16W(srcFullPath).c_str(),
+                    Common::UTF8ToUTF16W(destFullPath).c_str(), MOVEFILE_REPLACE_EXISTING)) {
         return true;
-#elif ANDROID
-    // srcFullPath and destFullPath are relative to the user directory
-    if (AndroidStorage::GetBuildFlavor() == AndroidStorage::AndroidBuildFlavors::GOOGLEPLAY) {
-        if (AndroidStorage::MoveAndRenameFile(srcFullPath, destFullPath))
+    }
+#elif defined(ANDROID) && !defined(HAVE_LIBRETRO_VFS)
+    if (AndroidUtils::CanUseRawFS()) {
+        if (rename(AndroidUtils::TranslateFilePath(srcFullPath).c_str(),
+                   AndroidUtils::TranslateFilePath(destFullPath).c_str()) == 0) {
             return true;
+        }
     } else {
-        std::optional<std::string> userDirLocation = AndroidStorage::GetUserDirectory();
-        if (userDirLocation && rename((*userDirLocation + srcFullPath).c_str(),
-                                      (*userDirLocation + destFullPath).c_str()) == 0) {
-            AndroidStorage::UpdateDocumentLocation(srcFullPath, destFullPath);
-            // ^ TODO: This shouldn't fail, but what should we do if it somehow does?
+        if (AndroidUtils::MoveAndRenameFile(srcFullPath, destFullPath)) {
             return true;
         }
     }
@@ -343,53 +450,90 @@ bool Copy(const std::string& srcFilename, const std::string& destFilename) {
     LOG_ERROR(Common_Filesystem, "failed {} --> {}: {}", srcFilename, destFilename,
               GetLastErrorMsg());
     return false;
-#elif ANDROID
-    return AndroidStorage::CopyFile(srcFilename, std::string(GetParentPath(destFilename)),
-                                    std::string(GetFilename(destFilename)));
 #else
+    auto copy_files = [](const std::string& src, const std::string& dst) -> bool {
+        // Open input file
+        FILE* input = FOPEN(src.c_str(), "rb");
+        if (!input) {
+            LOG_ERROR(Common_Filesystem, "opening input failed {} --> {}: {}", src, dst,
+                      GetLastErrorMsg());
+            return false;
+        }
+        SCOPE_EXIT({ FCLOSE(input); });
 
-    // Open input file
-    FILE* input = fopen(srcFilename.c_str(), "rb");
-    if (!input) {
-        LOG_ERROR(Common_Filesystem, "opening input failed {} --> {}: {}", srcFilename,
-                  destFilename, GetLastErrorMsg());
-        return false;
-    }
-    SCOPE_EXIT({ fclose(input); });
+        // open output file
+        FILE* output = FOPEN(dst.c_str(), "wb");
+        if (!output) {
+            LOG_ERROR(Common_Filesystem, "opening output failed {} --> {}: {}", src, dst,
+                      GetLastErrorMsg());
+            return false;
+        }
+        SCOPE_EXIT({ FCLOSE(output); });
 
-    // open output file
-    FILE* output = fopen(destFilename.c_str(), "wb");
-    if (!output) {
-        LOG_ERROR(Common_Filesystem, "opening output failed {} --> {}: {}", srcFilename,
-                  destFilename, GetLastErrorMsg());
-        return false;
-    }
-    SCOPE_EXIT({ fclose(output); });
+        // copy loop
+        std::array<char, 1024> buffer;
+        while (!FEOF(input)) {
+            // read input
+            std::size_t rnum = FREAD(buffer.data(), sizeof(char), buffer.size(), input);
+            if (rnum != buffer.size()) {
+                if (FERROR(input) != 0) {
+                    LOG_ERROR(Common_Filesystem, "failed reading from source, {} --> {}: {}", src,
+                              dst, GetLastErrorMsg());
+                    return false;
+                }
+            }
 
-    // copy loop
-    std::array<char, 1024> buffer;
-    while (!feof(input)) {
-        // read input
-        std::size_t rnum = fread(buffer.data(), sizeof(char), buffer.size(), input);
-        if (rnum != buffer.size()) {
-            if (ferror(input) != 0) {
-                LOG_ERROR(Common_Filesystem, "failed reading from source, {} --> {}: {}",
-                          srcFilename, destFilename, GetLastErrorMsg());
+            // write output
+            std::size_t wnum = FWRITE(buffer.data(), sizeof(char), rnum, output);
+            if (wnum != rnum) {
+                LOG_ERROR(Common_Filesystem, "failed writing to output, {} --> {}: {}", src, dst,
+                          GetLastErrorMsg());
                 return false;
             }
         }
 
-        // write output
-        std::size_t wnum = fwrite(buffer.data(), sizeof(char), rnum, output);
-        if (wnum != rnum) {
-            LOG_ERROR(Common_Filesystem, "failed writing to output, {} --> {}: {}", srcFilename,
-                      destFilename, GetLastErrorMsg());
-            return false;
-        }
+        return true;
+    };
+
+#if defined(ANDROID) && !defined(HAVE_LIBRETRO_VFS)
+    if (AndroidUtils::CanUseRawFS()) {
+        return copy_files(AndroidUtils::TranslateFilePath(srcFilename),
+                          AndroidUtils::TranslateFilePath(destFilename));
+    } else {
+        return AndroidUtils::CopyFile(srcFilename, std::string(GetParentPath(destFilename)),
+                                      std::string(GetFilename(destFilename)));
+    }
+#else
+    return copy_files(srcFilename, destFilename);
+#endif
+#endif
+}
+
+time_t GetDate(const std::string& filename) {
+    if (!Exists(filename)) {
+        LOG_ERROR(Common_Filesystem, "failed {}: No such file", filename);
+        return 0;
     }
 
-    return true;
+    if (IsDirectory(filename)) {
+        LOG_ERROR(Common_Filesystem, "failed {}: is a directory", filename);
+        return 0;
+    }
+
+    struct stat buf;
+
+#if defined(ANDROID) && !defined(HAVE_LIBRETRO_VFS)
+	if (stat(AndroidUtils::TranslateFilePath(filename).c_str(), &buf) == 0)
+#else
+    if (stat(filename.c_str(), &buf) == 0)
 #endif
+    {
+        LOG_ERROR(Common_Filesystem, "{}: {}", filename, buf.st_mtime);
+        return buf.st_mtime;
+    }
+
+    LOG_ERROR(Common_Filesystem, "Stat failed {}: {}", filename, GetLastErrorMsg());
+    return 0;
 }
 
 u64 GetSize(const std::string& filename) {
@@ -408,10 +552,16 @@ u64 GetSize(const std::string& filename) {
 #ifdef _WIN32
     struct _stat64 buf;
     if (_wstat64(Common::UTF8ToUTF16W(filename).c_str(), &buf) == 0)
-#elif ANDROID
-    u64 result = AndroidStorage::GetSize(filename);
-    LOG_TRACE(Common_Filesystem, "{}: {}", filename, result);
-    return result;
+#elif defined(ANDROID) && !defined(HAVE_LIBRETRO_VFS)
+    if (AndroidUtils::CanUseRawFS()) {
+        if (stat(AndroidUtils::TranslateFilePath(filename).c_str(), &buf) == 0) {
+            return buf.st_size;
+        }
+    } else {
+        u64 result = AndroidUtils::GetSize(filename);
+        LOG_TRACE(Common_Filesystem, "{}: {}", filename, result);
+        return result;
+    }
 #else
     if (stat(filename.c_str(), &buf) == 0)
 #endif
@@ -425,7 +575,7 @@ u64 GetSize(const std::string& filename) {
 }
 
 u64 GetSize(const int fd) {
-    struct stat buf;
+    file_stat_t buf;
     if (fstat(fd, &buf) != 0) {
         LOG_ERROR(Common_Filesystem, "GetSize: stat failed {}: {}", fd, GetLastErrorMsg());
         return 0;
@@ -435,13 +585,13 @@ u64 GetSize(const int fd) {
 
 u64 GetSize(FILE* f) {
     // can't use off_t here because it can be 32-bit
-    u64 pos = ftello(f);
-    if (fseeko(f, 0, SEEK_END) != 0) {
+    u64 pos = FTELL(f);
+    if (FSEEK(f, 0, SEEK_END) != 0) {
         LOG_ERROR(Common_Filesystem, "GetSize: seek failed {}: {}", fmt::ptr(f), GetLastErrorMsg());
         return 0;
     }
-    u64 size = ftello(f);
-    if ((size != pos) && (fseeko(f, pos, SEEK_SET) != 0)) {
+    u64 size = FTELL(f);
+    if ((size != pos) && (FSEEK(f, pos, SEEK_SET) != 0)) {
         LOG_ERROR(Common_Filesystem, "GetSize: seek failed {}: {}", fmt::ptr(f), GetLastErrorMsg());
         return 0;
     }
@@ -459,68 +609,97 @@ bool CreateEmptyFile(const std::string& filename) {
     return true;
 }
 
+namespace {
+
+#ifdef _WIN32
+
+std::optional<std::vector<std::string>> ListDirectoryEntries(const std::string& directory) {
+    std::vector<std::string> entries;
+
+    WIN32_FIND_DATAW ffd;
+    const std::wstring search_path = Common::UTF8ToUTF16W(directory + "\\*");
+
+    HANDLE handle = FindFirstFileW(search_path.c_str(), &ffd);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return std::nullopt;
+    }
+
+    do {
+        entries.emplace_back(Common::UTF16ToUTF8(ffd.cFileName));
+    } while (FindNextFileW(handle, &ffd) != 0);
+
+    FindClose(handle);
+    return entries;
+}
+
+#elif defined(ANDROID) && !defined(HAVE_LIBRETRO_VFS)
+
+std::optional<std::vector<std::string>> ListDirectoryEntries(const std::string& directory) {
+    if (AndroidUtils::CanUseRawFS()) {
+        std::vector<std::string> entries;
+
+        DIR* dirp = opendir(AndroidUtils::TranslateFilePath(directory).c_str());
+        if (!dirp)
+            return std::nullopt;
+
+        while (dirent* entry = readdir(dirp)) {
+            entries.emplace_back(entry->d_name);
+        }
+
+        closedir(dirp);
+        return entries;
+    } else {
+        return AndroidUtils::GetFilesName(directory);
+    }
+}
+
+#else
+
+std::optional<std::vector<std::string>> ListDirectoryEntries(const std::string& directory) {
+    std::vector<std::string> entries;
+
+    DIR* dirp = opendir(directory.c_str());
+    if (!dirp)
+        return std::nullopt;
+
+    while (dirent* entry = readdir(dirp)) {
+        entries.emplace_back(entry->d_name);
+    }
+
+    closedir(dirp);
+    return entries;
+}
+
+#endif
+
+} // anonymous namespace
+
 bool ForeachDirectoryEntry(u64* num_entries_out, const std::string& directory,
                            DirectoryEntryCallable callback) {
     LOG_TRACE(Common_Filesystem, "directory {}", directory);
 
-    // How many files + directories we found
-    u64 found_entries = 0;
-
-    // Save the status of callback function
-    bool callback_error = false;
-
-#ifdef _WIN32
-    // Find the first file in the directory.
-    WIN32_FIND_DATAW ffd;
-
-    HANDLE handle_find = FindFirstFileW(Common::UTF8ToUTF16W(directory + "\\*").c_str(), &ffd);
-    if (handle_find == INVALID_HANDLE_VALUE) {
-        FindClose(handle_find);
+    const auto entries = ListDirectoryEntries(directory);
+    if (!entries.has_value()) {
         return false;
     }
-    // windows loop
-    do {
-        const std::string virtual_name(Common::UTF16ToUTF8(ffd.cFileName));
-#elif ANDROID
-    // android loop
-    auto result = AndroidStorage::GetFilesName(directory);
-    for (auto virtual_name : result) {
-#else
-    DIR* dirp = opendir(directory.c_str());
-    if (!dirp)
-        return false;
 
-    // non windows loop
-    while (struct dirent* result = readdir(dirp)) {
-        const std::string virtual_name(result->d_name);
-#endif
+    u64 found_entries = 0;
 
+    for (const std::string& virtual_name : *entries) {
         if (virtual_name == "." || virtual_name == "..")
             continue;
 
         u64 ret_entries = 0;
-        if (!callback(&ret_entries, directory, virtual_name)) {
-            callback_error = true;
-            break;
-        }
+        if (!callback(&ret_entries, directory, virtual_name))
+            return false;
+
         found_entries += ret_entries;
-
-#ifdef _WIN32
-    } while (FindNextFileW(handle_find, &ffd) != 0);
-    FindClose(handle_find);
-#elif ANDROID
     }
-#else
-    }
-    closedir(dirp);
-#endif
-
-    if (callback_error)
-        return false;
 
     // num_entries_out is allowed to be specified nullptr, in which case we shouldn't try to set it
-    if (num_entries_out != nullptr)
+    if (num_entries_out)
         *num_entries_out = found_entries;
+
     return true;
 }
 
@@ -597,48 +776,39 @@ bool DeleteDirRecursively(const std::string& directory, unsigned int recursion) 
 
 void CopyDir([[maybe_unused]] const std::string& source_path,
              [[maybe_unused]] const std::string& dest_path) {
-#ifndef _WIN32
     if (source_path == dest_path)
         return;
+
     if (!FileUtil::Exists(source_path))
         return;
+
     if (!FileUtil::Exists(dest_path))
         FileUtil::CreateFullPath(dest_path);
 
-#ifdef ANDROID
-    auto result = AndroidStorage::GetFilesName(source_path);
-    for (auto virtualName : result) {
-#else
-    DIR* dirp = opendir(source_path.c_str());
-    if (!dirp)
+    const auto entries = ListDirectoryEntries(source_path);
+    if (!entries.has_value() || (*entries).empty())
         return;
 
-    while (struct dirent* result = readdir(dirp)) {
-        const std::string virtualName(result->d_name);
-#endif // ANDROID
-
-        // check for "." and ".."
-        if (((virtualName[0] == '.') && (virtualName[1] == '\0')) ||
-            ((virtualName[0] == '.') && (virtualName[1] == '.') && (virtualName[2] == '\0')))
+    for (const std::string& virtual_name : *entries) {
+        if (virtual_name == "." || virtual_name == "..")
             continue;
 
-        std::string source, dest;
-        source = source_path + virtualName;
-        dest = dest_path + virtualName;
+        std::string source = source_path + virtual_name;
+        std::string dest = dest_path + virtual_name;
+
         if (IsDirectory(source)) {
             source += '/';
             dest += '/';
+
             if (!FileUtil::Exists(dest))
                 FileUtil::CreateFullPath(dest);
-            CopyDir(source, dest);
-        } else if (!FileUtil::Exists(dest))
-            FileUtil::Copy(source, dest);
-    }
 
-#ifndef ANDROID
-    closedir(dirp);
-#endif // ANDROID
-#endif // _WIN32
+            CopyDir(source, dest);
+        } else {
+            if (!FileUtil::Exists(dest))
+                FileUtil::Copy(source, dest);
+        }
+    }
 }
 
 std::optional<std::string> GetCurrentDir() {
@@ -721,12 +891,16 @@ const std::string& GetExeDirectory() {
 }
 
 std::string AppDataRoamingDirectory() {
-    PWSTR pw_local_path = nullptr;
-    // Only supported by Windows Vista or later
-    SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &pw_local_path);
-    std::string local_path = Common::UTF16ToUTF8(pw_local_path);
-    CoTaskMemFree(pw_local_path);
-    return local_path;
+    PWSTR path = nullptr;
+
+    const HRESULT hr =
+        SHGetKnownFolderPath(FOLDERID_RoamingAppData, KF_FLAG_DEFAULT, nullptr, &path);
+
+    ASSERT_MSG(SUCCEEDED(hr) && path != nullptr, "Failed to get AppData directory: {:X}", hr);
+
+    std::string result = Common::UTF16ToUTF8(path);
+    CoTaskMemFree(path);
+    return result;
 }
 #else
 /**
@@ -811,7 +985,7 @@ void SetUserPath(const std::string& path) {
 
         g_paths.emplace(UserPath::ConfigDir, user_path + CONFIG_DIR DIR_SEP);
         g_paths.emplace(UserPath::CacheDir, user_path + CACHE_DIR DIR_SEP);
-#elif ANDROID
+#elif defined(ANDROID) && !defined(HAVE_LIBRETRO_VFS)
         user_path = "/";
         g_paths.emplace(UserPath::ConfigDir, user_path + CONFIG_DIR DIR_SEP);
         g_paths.emplace(UserPath::CacheDir, user_path + CACHE_DIR DIR_SEP);
@@ -1070,7 +1244,7 @@ std::string_view RemoveTrailingSlash(std::string_view path) {
 
 std::string SanitizePath(std::string_view path_, DirectorySeparator directory_separator) {
     std::string path(path_);
-#ifdef ANDROID
+#if defined(ANDROID) && !defined(HAVE_LIBRETRO_VFS)
     return std::string(RemoveTrailingSlash(path));
 #endif
     char type1 = directory_separator == DirectorySeparator::BackwardSlash ? '/' : '\\';
@@ -1126,49 +1300,204 @@ void IOFile::Swap(IOFile& other) noexcept {
     std::swap(flags, other.flags);
 }
 
+static const std::string outboxSuffix = "/OutBox__/BoxInfo_____";
+static std::string g_program_id = "";
+static std::map<std::string, std::string> cecIds;
+static std::mutex load_mutex;
+static std::mutex save_mutex;
+static std::mutex get_mutex;
+
+void setProgramId(std::string id)
+{
+	g_program_id = id;
+}
+
+static void toLower(std::string &str)
+{
+	for(size_t i=0; i<str.length(); i++)
+	{
+		str[i] = (char)std::tolower(str[i]);
+	}
+}
+
+static void loadCecIds();
+
+std::string getCecId(std::string programId)
+{
+	std::scoped_lock lock(get_mutex);
+	loadCecIds();
+	toLower(programId);
+	
+	return cecIds[programId];
+}
+
+static void saveId(std::string programId, std::string cecId)
+{
+	std::scoped_lock lock(save_mutex);
+	if(getCecId(programId) != "") return;
+	
+	toLower(programId);
+	
+	// ADD new CEC ID at the end of the file
+	LOG_ERROR(HW, "saveId");
+	
+    const std::string path{
+        fmt::format("{}/cecIds.txt", FileUtil::GetUserPath(FileUtil::UserPath::SysDataDir))};
+		
+    if (!FileUtil::CreateFullPath(path)) {
+        LOG_ERROR(Service_FS, "Failed to create cecIds.txt");
+        return;
+    }
+	
+    FileUtil::IOFile file{path, "a"};
+    if (!file.IsOpen()) {
+        LOG_ERROR(Service_FS, "Failed to open cecIds.txt");
+        return;
+    }
+	
+	std::string cecIdEntry = "\n" + programId + ":" + cecId + "\n";
+	
+	toLower(cecIdEntry);
+	
+	if (file.WriteBytes(cecIdEntry.c_str(), cecIdEntry.length()) != cecIdEntry.length()) {
+        LOG_ERROR(Service_FS, "Failed to write cec id fully");
+    }
+	
+	cecIds[programId] = cecId;
+}
+
 bool IOFile::Open() {
     Close();
 
-#ifdef _WIN32
-    if (flags == 0) {
-        flags = _SH_DENYNO;
+	if (filename.ends_with(outboxSuffix) 
+	&& (openmode.find("w") != std::string::npos || openmode.find("+") != std::string::npos)
+	&& filename.length() > outboxSuffix.length() + 8
+	&& g_program_id.length() == 16)
+	{
+		std::string cecId = filename.substr(filename.length() - outboxSuffix.length() - 8, 8);
+		
+		LOG_ERROR(Common_Filesystem, "Open on file: {}, with mode: {}", filename, openmode);
+		LOG_ERROR(Common_Filesystem, "Program ID: {}, CECD ID: {}", g_program_id, cecId);
+		
+		saveId(g_program_id, cecId);
+	}
+
+    // Any filename with the format fd://<file_descriptor> represents a file that
+    // must be opened by duplicating the provided file_descriptor. This is used
+    // on Android vanilla builds when the ROM absolute path is not known.
+    if (filename.starts_with("fd://")) {
+
+#if !defined(HAVE_LIBRETRO_VFS)
+        const std::string fd_str = filename.substr(5);
+
+        // Check that fd_str is not empty and contains only digits
+        if (fd_str.empty() || !std::all_of(fd_str.begin(), fd_str.end(), ::isdigit)) {
+            m_good = false;
+            return false;
+        }
+
+        int fd = std::stoi(fd_str);
+
+        int dup_fd = DUP_FD(fd);
+        if (dup_fd == -1) {
+            m_good = false;
+            return false;
+        }
+
+        m_file = FDOPEN(dup_fd, openmode.c_str());
+        if (!m_file) {
+            CLOSE_FD(dup_fd);
+            m_good = false;
+            return false;
+        }
+
+        m_good = true;
+        return true;
+#else
+        // TODO: Add support for libretro vfs when needed.
+        m_good = false;
+        return false;
+#endif
     }
-    m_file = _wfsopen(Common::UTF8ToUTF16W(filename).c_str(),
-                      Common::UTF8ToUTF16W(openmode).c_str(), flags);
+
+#ifdef _WIN32
+    // Open with FILE_SHARE_READ, FILE_SHARE_WRITE and FILE_SHARE_DELETE
+    // flags. This mimics linux behaviour as much as possible, which
+    // the 3DS also does.
+
+    const std::wstring wfilename = Common::UTF8ToUTF16W(filename);
+
+    DWORD access = 0;
+    DWORD creation = OPEN_EXISTING;
+
+    if (openmode.find("r") != std::string::npos)
+        access |= GENERIC_READ;
+    if (openmode.find("w") != std::string::npos) {
+        access |= GENERIC_WRITE;
+        creation = CREATE_ALWAYS;
+    }
+    if (openmode.find("a") != std::string::npos) {
+        access |= FILE_APPEND_DATA;
+        creation = OPEN_ALWAYS;
+    }
+    if (openmode.find("+") != std::string::npos) {
+        access |= GENERIC_READ | GENERIC_WRITE;
+    }
+
+    HANDLE h = CreateFileW(wfilename.c_str(), access,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           creation, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+    if (h == INVALID_HANDLE_VALUE) {
+        m_good = false;
+        return false;
+    }
+
+    int fd = _open_osfhandle(reinterpret_cast<intptr_t>(h), 0);
+    if (fd == -1) {
+        CloseHandle(h);
+        m_good = false;
+        return m_good;
+    }
+
+    m_file = _fdopen(fd, openmode.c_str());
     m_good = m_file != nullptr;
 
-#elif ANDROID
-    // Check whether filepath is startsWith content
-    AndroidStorage::AndroidOpenMode android_open_mode = AndroidStorage::ParseOpenmode(openmode);
-    if (android_open_mode == AndroidStorage::AndroidOpenMode::WRITE ||
-        android_open_mode == AndroidStorage::AndroidOpenMode::READ_WRITE ||
-        android_open_mode == AndroidStorage::AndroidOpenMode::WRITE_APPEND ||
-        android_open_mode == AndroidStorage::AndroidOpenMode::WRITE_TRUNCATE ||
-        android_open_mode == AndroidStorage::AndroidOpenMode::READ_WRITE_TRUNCATE ||
-        android_open_mode == AndroidStorage::AndroidOpenMode::READ_WRITE_APPEND) {
-        if (!FileUtil::Exists(filename)) {
-            std::string directory(GetParentPath(filename));
-            std::string display_name(GetFilename(filename));
-            if (!AndroidStorage::CreateFile(directory, display_name)) {
-                m_good = m_file != nullptr;
-                return m_good;
+#elif defined(ANDROID) && !defined(HAVE_LIBRETRO_VFS)
+    if (AndroidUtils::CanUseRawFS()) {
+        m_file = FOPEN(AndroidUtils::TranslateFilePath(filename).c_str(), openmode.c_str());
+    } else {
+        // Check whether filepath is startsWith content
+        AndroidUtils::AndroidOpenMode android_open_mode = AndroidUtils::ParseOpenmode(openmode);
+        if (android_open_mode == AndroidUtils::AndroidOpenMode::WRITE ||
+            android_open_mode == AndroidUtils::AndroidOpenMode::READ_WRITE ||
+            android_open_mode == AndroidUtils::AndroidOpenMode::WRITE_APPEND ||
+            android_open_mode == AndroidUtils::AndroidOpenMode::WRITE_TRUNCATE ||
+            android_open_mode == AndroidUtils::AndroidOpenMode::READ_WRITE_TRUNCATE ||
+            android_open_mode == AndroidUtils::AndroidOpenMode::READ_WRITE_APPEND) {
+            if (!FileUtil::Exists(filename)) {
+                std::string directory(GetParentPath(filename));
+                std::string display_name(GetFilename(filename));
+                if (!AndroidUtils::CreateFile(directory, display_name)) {
+                    m_good = m_file != nullptr;
+                    return m_good;
+                }
+            }
+        }
+        m_fd = AndroidUtils::OpenContentUri(filename, android_open_mode);
+        if (m_fd != -1) {
+            int error_num = 0;
+            m_file = fdopen(m_fd, openmode.c_str());
+            error_num = errno;
+            if (error_num != 0 && m_file == nullptr) {
+                LOG_ERROR(Common_Filesystem, "Error on file: {}, error: {}", filename,
+                          strerror(error_num));
             }
         }
     }
-    m_fd = AndroidStorage::OpenContentUri(filename, android_open_mode);
-    if (m_fd != -1) {
-        int error_num = 0;
-        m_file = fdopen(m_fd, openmode.c_str());
-        error_num = errno;
-        if (error_num != 0 && m_file == nullptr) {
-            LOG_ERROR(Common_Filesystem, "Error on file: {}, error: {}", filename,
-                      strerror(error_num));
-        }
-    }
-
     m_good = m_file != nullptr;
 #else
-    m_file = std::fopen(filename.c_str(), openmode.c_str());
+    m_file = FOPEN(filename.c_str(), openmode.c_str());
     m_good = m_file != nullptr;
 #endif
 
@@ -1176,7 +1505,7 @@ bool IOFile::Open() {
 }
 
 bool IOFile::Close() {
-    if (!IsOpen() || 0 != std::fclose(m_file))
+    if (!IsOpen() || 0 != FCLOSE(m_file))
         m_good = false;
 
     m_file = nullptr;
@@ -1191,7 +1520,7 @@ u64 IOFile::GetSize() const {
 }
 
 bool IOFile::SeekImpl(s64 off, int origin) {
-    if (!IsOpen() || 0 != fseeko(m_file, off, origin))
+    if (!IsOpen() || 0 != FSEEK(m_file, off, origin))
         m_good = false;
 
     return m_good;
@@ -1199,13 +1528,13 @@ bool IOFile::SeekImpl(s64 off, int origin) {
 
 u64 IOFile::TellImpl() const {
     if (IsOpen())
-        return ftello(m_file);
+        return FTELL(m_file);
 
     return std::numeric_limits<u64>::max();
 }
 
 bool IOFile::Flush() {
-    if (!IsOpen() || 0 != std::fflush(m_file))
+    if (!IsOpen() || 0 != FFLUSH(m_file))
         m_good = false;
 
     return m_good;
@@ -1223,7 +1552,7 @@ std::size_t IOFile::ReadImpl(void* data, std::size_t length, std::size_t data_si
 
     DEBUG_ASSERT(data != nullptr);
 
-    return std::fread(data, data_size, length, m_file);
+    return FREAD(data, data_size, length, m_file);
 }
 
 #ifdef _WIN32
@@ -1266,7 +1595,16 @@ std::size_t IOFile::ReadAtImpl(void* data, std::size_t byte_count, std::size_t o
 
     DEBUG_ASSERT(data != nullptr);
 
+#ifdef HAVE_LIBRETRO_VFS
+    std::scoped_lock lock(m_file_pos_mutex);
+    int64_t pos = filestream_tell(m_file);
+    FSEEK(m_file, offset, RETRO_VFS_SEEK_POSITION_START);
+    int64_t rv = FREAD(data, 1, byte_count, m_file);
+    FSEEK(m_file, pos, RETRO_VFS_SEEK_POSITION_START);
+    return rv;
+#else
     return pread(fileno(m_file), data, byte_count, offset);
+#endif
 }
 
 std::size_t IOFile::WriteImpl(const void* data, std::size_t length, std::size_t data_size) {
@@ -1281,12 +1619,58 @@ std::size_t IOFile::WriteImpl(const void* data, std::size_t length, std::size_t 
 
     DEBUG_ASSERT(data != nullptr);
 
+#if defined(HAVE_LIBRETRO_VFS)
+    return rfwrite(data, data_size, length, m_file) / data_size;
+#else
     return std::fwrite(data, data_size, length, m_file);
+#endif
+}
+
+bool IOFile::ReadLine(std::string& line) {
+    line.clear();
+
+    char ch;
+    bool read_anything = false;
+
+    while (true) {
+        const std::size_t read = ReadImpl(&ch, sizeof(ch), 1);
+
+        if (read != sizeof(ch)) {
+            return read_anything;
+        }
+        read_anything = true;
+
+        if (ch == '\n') {
+            return true;
+        }
+
+        // Always convert to UNIX style
+        if (ch != '\r') {
+            line.push_back(ch);
+        }
+    }
+}
+
+size_t IOFile::WriteLine(const std::string_view line) {
+    const size_t written_line = WriteImpl(line.data(), line.size(), 1);
+    if (written_line != line.size()) {
+        return written_line;
+    }
+
+    char nl = '\n';
+    const size_t written_nl = WriteImpl(&nl, sizeof(nl), 1);
+    if (written_nl != sizeof(nl)) {
+        return written_nl;
+    }
+
+    return written_line + written_nl;
 }
 
 bool IOFile::Resize(u64 size) {
     if (!IsOpen() || 0 !=
-#ifdef _WIN32
+#if defined(HAVE_LIBRETRO_VFS)
+                         filestream_truncate(m_file, size)
+#elif defined(_WIN32)
                          // ector: _chsize sucks, not 64-bit safe
                          // F|RES: changed to _chsize_s. i think it is 64-bit safe
                          _chsize_s(_fileno(m_file), size)
@@ -1416,6 +1800,42 @@ void OpenFStream<std::ios_base::in>(
     boost::iostreams::file_descriptor_source file_descriptor_source(fd,
                                                                     boost::iostreams::close_handle);
     fstream.open(file_descriptor_source);
+}
+
+static void loadCecIds()
+{
+	std::scoped_lock lock(load_mutex);
+	static bool loaded = false;
+	if(loaded) return;
+	
+    const std::string filepath = FileUtil::GetUserPath(FileUtil::UserPath::SysDataDir) + "cecIds.txt";
+    FileUtil::CreateFullPath(filepath);
+
+    boost::iostreams::stream<boost::iostreams::file_descriptor_source> file;
+    FileUtil::OpenFStream<std::ios_base::in>(file, filepath);
+	
+    if (file.is_open())
+	{
+		while (!file.eof())
+		{
+			std::string line;
+			std::getline(file, line);
+			
+			if(line.ends_with("\r"))
+			{
+				line.pop_back();
+			}
+			
+			toLower(line);
+
+			if (line.length() == 25 && line[16] == ':' && !line.starts_with("#"))
+			{
+				cecIds[line.substr(0, 16)] = line.substr(17, 8);
+			}
+		}
+		
+		loaded = true;
+	}
 }
 
 template <>

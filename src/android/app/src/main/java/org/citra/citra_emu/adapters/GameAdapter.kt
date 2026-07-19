@@ -1,29 +1,28 @@
-//FILE MODIFIED BY AzaharPlus APRIL 2025
-
 // Copyright Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
 package org.citra.citra_emu.adapters
 
-import android.graphics.drawable.Icon
+import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
+import android.content.pm.ShortcutInfo
+import android.content.pm.ShortcutManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.Icon
 import android.net.Uri
 import android.os.SystemClock
 import android.text.TextUtils
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import android.content.Context
-import android.content.SharedPreferences
-import android.widget.TextView
 import android.widget.ImageView
+import android.widget.PopupMenu
+import android.widget.TextView
 import android.widget.Toast
-import android.graphics.drawable.BitmapDrawable
-import android.graphics.Bitmap
-import android.content.pm.ShortcutInfo
-import android.content.pm.ShortcutManager
-import android.graphics.BitmapFactory
 import androidx.activity.result.ActivityResultLauncher
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.edit
@@ -31,23 +30,23 @@ import androidx.core.graphics.scale
 import androidx.core.net.toUri
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.lifecycleScope
 import androidx.navigation.findNavController
 import androidx.preference.PreferenceManager
 import androidx.recyclerview.widget.AsyncDifferConfig
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
-import android.widget.PopupMenu
 import com.google.android.material.bottomsheet.BottomSheetBehavior
 import com.google.android.material.bottomsheet.BottomSheetDialog
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.color.MaterialColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CoroutineScope
-import org.citra.citra_emu.HomeNavigationDirections
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import org.citra.citra_emu.CitraApplication
+import org.citra.citra_emu.HomeNavigationDirections
 import org.citra.citra_emu.NativeLibrary
 import org.citra.citra_emu.R
 import org.citra.citra_emu.adapters.GameAdapter.GameViewHolder
@@ -56,18 +55,22 @@ import org.citra.citra_emu.databinding.DialogShortcutBinding
 import org.citra.citra_emu.features.cheats.ui.CheatsFragmentDirections
 import org.citra.citra_emu.fragments.IndeterminateProgressDialogFragment
 import org.citra.citra_emu.model.Game
+import org.citra.citra_emu.utils.BuildUtil
 import org.citra.citra_emu.utils.FileUtil
 import org.citra.citra_emu.utils.GameIconUtils
+import org.citra.citra_emu.utils.Log
 import org.citra.citra_emu.viewmodel.GamesViewModel
 
 class GameAdapter(
     private val activity: AppCompatActivity,
     private val inflater: LayoutInflater,
     private val openImageLauncher: ActivityResultLauncher<String>?,
-    private val onRequestCompressOrDecompress: ((inputPath: String, suggestedName: String, shouldCompress: Boolean) -> Unit)? = null
-) :
-    ListAdapter<Game, GameViewHolder>(AsyncDifferConfig.Builder(DiffCallback()).build()),
-    View.OnClickListener, View.OnLongClickListener {
+    private val onRequestCompressOrDecompress: (
+        (inputPath: String, suggestedName: String, shouldCompress: Boolean) -> Unit
+    )? = null
+) : ListAdapter<Game, GameViewHolder>(AsyncDifferConfig.Builder(DiffCallback()).build()),
+    View.OnClickListener,
+    View.OnLongClickListener {
     private var lastClickTime = 0L
     private var imagePath: String? = null
     private var dialogShortcutBinding: DialogShortcutBinding? = null
@@ -138,7 +141,7 @@ class GameAdapter(
         val holder = view.tag as GameViewHolder
         gameExists(holder)
 
-        if (holder.game.titleId == 0L) {
+        if (!holder.game.valid) {
             MaterialAlertDialogBuilder(context)
                 .setTitle(R.string.properties)
                 .setMessage(R.string.properties_not_loaded)
@@ -155,12 +158,21 @@ class GameAdapter(
         if (holder.game.isInstalled) {
             return true
         }
-
-        val gameExists = DocumentFile.fromSingleUri(
-            CitraApplication.appContext,
-            Uri.parse(holder.game.path)
-        )?.exists() == true
+        val path = holder.game.path
+        val pathUri = path.toUri()
+        var gameExists: Boolean
+        if (BuildUtil.isGooglePlayBuild || FileUtil.isNativePath(path)) {
+            gameExists =
+                DocumentFile.fromSingleUri(
+                    CitraApplication.appContext,
+                    pathUri
+                )?.exists() == true
+        } else {
+            val nativePath = NativeLibrary.getNativePath(pathUri)
+            gameExists = NativeLibrary.nativeFileExists(nativePath)
+        }
         return if (!gameExists) {
+            Log.error("[GameAdapter] ROM file does not exist: $path")
             Toast.makeText(
                 CitraApplication.appContext,
                 R.string.loader_error_file_not_found,
@@ -202,15 +214,18 @@ class GameAdapter(
             binding.textGameTitle.text = game.title
             binding.textCompany.text = game.company
             binding.textGameRegion.text = game.regions
-            binding.imageCartridge.visibility = if (preferences.getString("insertedCartridge", "") != game.path) {
-                View.GONE
-            } else {
-                View.VISIBLE
-            }
+            binding.imageCartridge.visibility =
+                if (preferences.getString("insertedCartridge", "") != game.path) {
+                    View.GONE
+                } else {
+                    View.VISIBLE
+                }
 
             val backgroundColorId =
                 if (
-                    isValidGame(game.filename.substring(game.filename.lastIndexOf(".") + 1).lowercase())
+                    isValidGame(
+                        game.filename.substring(game.filename.lastIndexOf(".") + 1).lowercase()
+                    )
                 ) {
                     R.attr.colorSurface
                 } else {
@@ -250,16 +265,45 @@ class GameAdapter(
         val extraDir: String
     )
     private fun getGameDirectories(game: Game): GameDirectories {
-        val basePath = "sdmc/Nintendo 3DS/00000000000000000000000000000000/00000000000000000000000000000000"
+        val basePath =
+            "sdmc/Nintendo 3DS/00000000000000000000000000000000/00000000000000000000000000000000"
         return GameDirectories(
             gameDir = game.path.substringBeforeLast("/"),
-            saveDir = basePath + "/title/${String.format("%016x", game.titleId).lowercase().substring(0, 8)}/${String.format("%016x", game.titleId).lowercase().substring(8)}/data/00000001",
+            saveDir =
+                basePath +
+                    "/title/${String.format(
+                        "%016x",
+                        game.titleId
+                    ).lowercase().substring(
+                        0,
+                        8
+                    )}/${String.format(
+                        "%016x",
+                        game.titleId
+                    ).lowercase().substring(8)}/data/00000001",
             modsDir = "load/mods/${String.format("%016X", game.titleId)}",
             texturesDir = "load/textures/${String.format("%016X", game.titleId)}",
-            appDir = game.path.substringBeforeLast("/").split("/").filter { it.isNotEmpty() }.joinToString("/"),
-            dlcDir = basePath + "/title/0004008c/${String.format("%016x", game.titleId).lowercase().substring(8)}/content",
-            updatesDir = basePath + "/title/0004000e/${String.format("%016x", game.titleId).lowercase().substring(8)}/content",
-            extraDir = basePath + "/extdata/00000000/${String.format("%016X", game.titleId).substring(8, 14).padStart(8, '0')}"
+            appDir = game.path.substringBeforeLast("/").split("/").filter {
+                it.isNotEmpty()
+            }.joinToString("/"),
+            dlcDir =
+                basePath +
+                    "/title/0004008c/${String.format(
+                        "%016x",
+                        game.titleId
+                    ).lowercase().substring(8)}/content",
+            updatesDir =
+                basePath +
+                    "/title/0004000e/${String.format(
+                        "%016x",
+                        game.titleId
+                    ).lowercase().substring(8)}/content",
+            extraDir =
+                basePath +
+                    "/extdata/00000000/${String.format(
+                        "%016X",
+                        game.titleId
+                    ).substring(8, 14).padStart(8, '0')}"
         )
     }
 
@@ -289,13 +333,36 @@ class GameAdapter(
                 .setType("*/*")
 
             val uri = when (menuItem.itemId) {
-                R.id.game_context_open_app -> CitraApplication.documentsTree.folderUriHelper(dirs.appDir)
-                R.id.game_context_open_save_dir -> CitraApplication.documentsTree.folderUriHelper(dirs.saveDir)
-                R.id.game_context_open_updates -> CitraApplication.documentsTree.folderUriHelper(dirs.updatesDir)
-                R.id.game_context_open_dlc -> CitraApplication.documentsTree.folderUriHelper(dirs.dlcDir)
-                R.id.game_context_open_extra -> CitraApplication.documentsTree.folderUriHelper(dirs.extraDir)
-                R.id.game_context_open_textures -> CitraApplication.documentsTree.folderUriHelper(dirs.texturesDir, true)
-                R.id.game_context_open_mods -> CitraApplication.documentsTree.folderUriHelper(dirs.modsDir, true)
+                R.id.game_context_open_app -> CitraApplication.documentsTree.folderUriHelper(
+                    dirs.appDir
+                )
+
+                R.id.game_context_open_save_dir -> CitraApplication.documentsTree.folderUriHelper(
+                    dirs.saveDir
+                )
+
+                R.id.game_context_open_updates -> CitraApplication.documentsTree.folderUriHelper(
+                    dirs.updatesDir
+                )
+
+                R.id.game_context_open_dlc -> CitraApplication.documentsTree.folderUriHelper(
+                    dirs.dlcDir
+                )
+
+                R.id.game_context_open_extra -> CitraApplication.documentsTree.folderUriHelper(
+                    dirs.extraDir
+                )
+
+                R.id.game_context_open_textures -> CitraApplication.documentsTree.folderUriHelper(
+                    dirs.texturesDir,
+                    true
+                )
+
+                R.id.game_context_open_mods -> CitraApplication.documentsTree.folderUriHelper(
+                    dirs.modsDir,
+                    true
+                )
+
                 else -> null
             }
 
@@ -309,7 +376,11 @@ class GameAdapter(
         popup.show()
     }
 
-    private fun showUninstallContextMenu(view: View, game: Game, bottomSheetDialog: BottomSheetDialog) {
+    private fun showUninstallContextMenu(
+        view: View,
+        game: Game,
+        bottomSheetDialog: BottomSheetDialog
+    ) {
         val dirs = getGameDirectories(game)
         val popup = PopupMenu(view.context, view).apply {
             menuInflater.inflate(R.menu.game_context_menu_uninstall, menu)
@@ -325,21 +396,45 @@ class GameAdapter(
             }
         }
 
+        val titleId = game.titleId
+        val dlcTitleId = titleId or 0x8C00000000L
+        val updateTitleId = titleId or 0xE00000000L
+
         popup.setOnMenuItemClickListener { menuItem ->
             val uninstallAction: () -> Unit = {
                 when (menuItem.itemId) {
-                    R.id.game_context_uninstall -> CitraApplication.documentsTree.deleteDocument(dirs.gameDir)
-                    R.id.game_context_uninstall_dlc -> FileUtil.deleteDocument(CitraApplication.documentsTree.folderUriHelper(dirs.dlcDir)
-                        .toString())
-                    R.id.game_context_uninstall_updates -> FileUtil.deleteDocument(CitraApplication.documentsTree.folderUriHelper(dirs.updatesDir)
-                        .toString())
+                    R.id.game_context_uninstall -> NativeLibrary.uninstallTitle(
+                        titleId,
+                        game.mediaType
+                    )
+
+                    R.id.game_context_uninstall_dlc -> NativeLibrary.uninstallTitle(
+                        dlcTitleId,
+                        Game.MediaType.SDMC
+                    )
+
+                    R.id.game_context_uninstall_updates -> NativeLibrary.uninstallTitle(
+                        updateTitleId,
+                        Game.MediaType.SDMC
+                    )
                 }
                 ViewModelProvider(activity)[GamesViewModel::class.java].reloadGames(true)
                 bottomSheetDialog.dismiss()
             }
 
-            if (menuItem.itemId in listOf(R.id.game_context_uninstall, R.id.game_context_uninstall_dlc, R.id.game_context_uninstall_updates)) {
-                IndeterminateProgressDialogFragment.newInstance(activity, R.string.uninstalling, false, uninstallAction)
+            if (menuItem.itemId in
+                listOf(
+                    R.id.game_context_uninstall,
+                    R.id.game_context_uninstall_dlc,
+                    R.id.game_context_uninstall_updates
+                )
+            ) {
+                IndeterminateProgressDialogFragment.newInstance(
+                    activity,
+                    R.string.uninstalling,
+                    false,
+                    uninstallAction
+                )
                     .show(activity.supportFragmentManager, IndeterminateProgressDialogFragment.TAG)
                 true
             } else {
@@ -350,7 +445,12 @@ class GameAdapter(
         popup.show()
     }
 
-    private fun showAboutGameDialog(context: Context, game: Game, holder: GameViewHolder, view: View) {
+    private fun showAboutGameDialog(
+        context: Context,
+        game: Game,
+        holder: GameViewHolder,
+        view: View
+    ) {
         val bottomSheetView = inflater.inflate(R.layout.dialog_about_game, null)
 
         val bottomSheetDialog = BottomSheetDialog(context)
@@ -362,12 +462,22 @@ class GameAdapter(
         bottomSheetView.findViewById<TextView>(R.id.about_game_title).text = game.title
         bottomSheetView.findViewById<TextView>(R.id.about_game_company).text = game.company
         bottomSheetView.findViewById<TextView>(R.id.about_game_region).text = game.regions
-        bottomSheetView.findViewById<TextView>(R.id.about_game_id).text = context.getString(R.string.game_context_id) + " " + String.format("%016X", game.titleId)
-        bottomSheetView.findViewById<TextView>(R.id.about_game_filename).text = context.getString(R.string.game_context_file) + " " + game.filename
-        bottomSheetView.findViewById<TextView>(R.id.about_game_filetype).text = context.getString(R.string.game_context_type) + " " + game.fileType
+        bottomSheetView.findViewById<TextView>(R.id.about_game_id).text =
+            context.getString(R.string.game_context_id) + " " + String.format("%016X", game.titleId)
+        bottomSheetView.findViewById<TextView>(R.id.about_game_filename).text =
+            context.getString(R.string.game_context_file) + " " + game.filename
+        bottomSheetView.findViewById<TextView>(R.id.about_game_filetype).text =
+            context.getString(R.string.game_context_type) + " " + game.fileType
 
-        val insertButton = bottomSheetView.findViewById<MaterialButton>(R.id.insert_cartridge_button)
-        insertButton.text = if (inserted) { context.getString(R.string.game_context_eject) } else { context.getString(R.string.game_context_insert) }
+        val insertButton = bottomSheetView.findViewById<MaterialButton>(
+            R.id.insert_cartridge_button
+        )
+        insertButton.text =
+            if (inserted) {
+                context.getString(R.string.game_context_eject)
+            } else {
+                context.getString(R.string.game_context_insert)
+            }
         insertButton.visibility = if (insertable) View.VISIBLE else View.GONE
         insertButton.setOnClickListener {
             if (inserted) {
@@ -408,7 +518,7 @@ class GameAdapter(
             val preferences = PreferenceManager.getDefaultSharedPreferences(context)
 
             // Default to false for zoomed in shortcut icons
-            preferences.edit() {
+            preferences.edit {
                 putBoolean(
                     "shouldStretchIcon",
                     false
@@ -440,10 +550,15 @@ class GameAdapter(
                 .setPositiveButton(android.R.string.ok) { _, _ ->
                     val shortcutName = dialogShortcutBinding!!.shortcutNameInput.text.toString()
                     if (shortcutName.isEmpty()) {
-                        Toast.makeText(context, R.string.shortcut_name_empty, Toast.LENGTH_LONG).show()
+                        Toast.makeText(
+                            context,
+                            R.string.shortcut_name_empty,
+                            Toast.LENGTH_LONG
+                        ).show()
                         return@setPositiveButton
                     }
-                    val iconBitmap = (dialogShortcutBinding!!.shortcutIcon.drawable as BitmapDrawable).bitmap
+                    val iconBitmap =
+                        (dialogShortcutBinding!!.shortcutIcon.drawable as BitmapDrawable).bitmap
                     val shortcutManager = activity.getSystemService(ShortcutManager::class.java)
 
                     CoroutineScope(Dispatchers.IO).launch {
@@ -451,9 +566,11 @@ class GameAdapter(
                         val shortcut = ShortcutInfo.Builder(context, shortcutName)
                             .setShortLabel(shortcutName)
                             .setIcon(icon)
-                            .setIntent(game.launchIntent.apply {
-                                putExtra("launchedFromShortcut", true)
-                            })
+                            .setIntent(
+                                game.launchIntent.apply {
+                                    putExtra("launchedFromShortcut", true)
+                                }
+                            )
                             .build()
 
                         shortcutManager?.requestPinShortcut(shortcut, null)
@@ -474,7 +591,9 @@ class GameAdapter(
             bottomSheetDialog.dismiss()
         }
 
-        val compressDecompressButton = bottomSheetView.findViewById<MaterialButton>(R.id.compress_decompress)
+        val compressDecompressButton = bottomSheetView.findViewById<MaterialButton>(
+            R.id.compress_decompress
+        )
         if (game.isInstalled) {
             compressDecompressButton.setOnClickListener {
                 Toast.makeText(
@@ -487,20 +606,88 @@ class GameAdapter(
         } else {
             compressDecompressButton.setOnClickListener {
                 val shouldCompress = !game.isCompressed
-                val recommendedExt = NativeLibrary.getRecommendedExtension(holder.game.path, shouldCompress)
+                val recommendedExt = NativeLibrary.getRecommendedExtension(
+                    holder.game.path,
+                    shouldCompress
+                )
                 val baseName = holder.game.filename.substringBeforeLast('.')
-                onRequestCompressOrDecompress?.invoke(holder.game.path, "$baseName.$recommendedExt", shouldCompress)
+                onRequestCompressOrDecompress?.invoke(
+                    holder.game.path,
+                    "$baseName.$recommendedExt",
+                    shouldCompress
+                )
                 bottomSheetDialog.dismiss()
             }
         }
-        compressDecompressButton.text = context.getString(if (!game.isCompressed) R.string.compress else R.string.decompress)
+        compressDecompressButton.text =
+            context.getString(if (!game.isCompressed) R.string.compress else R.string.decompress)
 
         bottomSheetView.findViewById<MaterialButton>(R.id.menu_button_open).setOnClickListener {
             showOpenContextMenu(it, game)
         }
 
-        bottomSheetView.findViewById<MaterialButton>(R.id.menu_button_uninstall).setOnClickListener {
+        bottomSheetView.findViewById<MaterialButton>(
+            R.id.menu_button_uninstall
+        ).setOnClickListener {
             showUninstallContextMenu(it, game, bottomSheetDialog)
+        }
+
+        bottomSheetView.findViewById<MaterialButton>(R.id.delete_cache).setOnClickListener {
+            val options =
+                arrayOf(context.getString(R.string.vulkan), context.getString(R.string.opengles))
+            var selectedIndex = -1
+            val dialog = MaterialAlertDialogBuilder(context)
+                .setTitle(R.string.delete_cache_select_backend)
+                .setSingleChoiceItems(options, -1) { dialog, which ->
+                    selectedIndex = which
+                }
+                .setPositiveButton(android.R.string.ok) { _, _ ->
+                    val progToast = Toast.makeText(
+                        CitraApplication.appContext,
+                        R.string.deleting_shader_cache,
+                        Toast.LENGTH_LONG
+                    )
+                    progToast.show()
+
+                    activity.lifecycleScope.launch(Dispatchers.IO) {
+                        when (selectedIndex) {
+                            0 -> {
+                                NativeLibrary.deleteVulkanShaderCache(game.titleId)
+                            }
+
+                            1 -> {
+                                NativeLibrary.deleteOpenGLShaderCache(game.titleId)
+                            }
+                        }
+
+                        activity.runOnUiThread {
+                            progToast.cancel()
+                            Toast.makeText(
+                                CitraApplication.appContext,
+                                R.string.shader_cache_deleted,
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    }
+                }
+                .setNegativeButton(android.R.string.cancel) { dialog, _ ->
+                    dialog.dismiss()
+                }
+                .create()
+
+            dialog.setOnShowListener {
+                val positiveButton = dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE)
+
+                positiveButton.isEnabled = false
+
+                val listView = dialog.listView
+                listView.setOnItemClickListener { _, _, position, _ ->
+                    selectedIndex = position
+                    positiveButton.isEnabled = true
+                }
+            }
+
+            dialog.show()
         }
 
         val bottomSheetBehavior = bottomSheetDialog.getBehavior()
@@ -551,18 +738,16 @@ class GameAdapter(
         }
     }
 
-    private fun isValidGame(extension: String): Boolean {
-        return Game.badExtensions.stream()
-            .noneMatch { extension == it.lowercase() }
-    }
+    private fun isValidGame(extension: String): Boolean = Game.badExtensions.stream()
+        .noneMatch { extension == it.lowercase() }
 
     private class DiffCallback : DiffUtil.ItemCallback<Game>() {
         override fun areItemsTheSame(oldItem: Game, newItem: Game): Boolean {
-            return oldItem.titleId == newItem.titleId
+            // The title is taken into account to support 3DSX, which all have the titleID 0.
+            // This only works now because we always return the English title, adjust if that changes.
+            return oldItem.titleId == newItem.titleId && oldItem.title == newItem.title
         }
 
-        override fun areContentsTheSame(oldItem: Game, newItem: Game): Boolean {
-            return oldItem == newItem
-        }
+        override fun areContentsTheSame(oldItem: Game, newItem: Game): Boolean = oldItem == newItem
     }
 }

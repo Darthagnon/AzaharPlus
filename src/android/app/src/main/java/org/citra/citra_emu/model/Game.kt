@@ -1,27 +1,32 @@
-//FILE MODIFIED BY AzaharPlus APRIL 2025
-
 // Copyright Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
 package org.citra.citra_emu.model
 
-import android.os.Parcelable
 import android.content.Intent
 import android.net.Uri
+import android.os.Parcelable
+import androidx.core.net.toUri
+import java.io.File
+import java.io.IOException
 import java.util.HashSet
 import kotlinx.parcelize.Parcelize
 import kotlinx.serialization.Serializable
 import org.citra.citra_emu.CitraApplication
+import org.citra.citra_emu.NativeLibrary
 import org.citra.citra_emu.activities.EmulationActivity
+import org.citra.citra_emu.utils.BuildUtil
 
 @Parcelize
 @Serializable
 class Game(
+    val valid: Boolean = false,
     val title: String = "",
     val description: String = "",
     val path: String = "",
     val titleId: Long = 0L,
+    val mediaType: MediaType = MediaType.GAME_CARD,
     val company: String = "",
     val regions: String = "",
     val isInstalled: Boolean = false,
@@ -31,18 +36,33 @@ class Game(
     val icon: IntArray? = null,
     val fileType: String = "",
     val isCompressed: Boolean = false,
-    val filename: String,
+    val filename: String
 ) : Parcelable {
     val keyAddedToLibraryTime get() = "${filename}_AddedToLibraryTime"
     val keyLastPlayedTime get() = "${filename}_LastPlayed"
 
     val launchIntent: Intent
-        get() = Intent(CitraApplication.appContext, EmulationActivity::class.java).apply {
-            action = Intent.ACTION_VIEW
-            data = if (isInstalled) {
-                CitraApplication.documentsTree.getUri(path)
+        get() {
+            var appUri: Uri
+            if (isInstalled) {
+                if (BuildUtil.isGooglePlayBuild) {
+                    appUri = CitraApplication.documentsTree.getUri(path)
+                } else {
+                    val nativePath = NativeLibrary.getUserDirectory() + "/" + path
+                    val nativeFile = File(nativePath)
+                    if (!nativeFile.exists()) {
+                        throw IOException(
+                            "Attempting to create shortcut for an executable that doesn't exist: $nativePath"
+                        )
+                    }
+                    appUri = Uri.fromFile(nativeFile)
+                }
             } else {
-                Uri.parse(path)
+                appUri = path.toUri()
+            }
+            return Intent(CitraApplication.appContext, EmulationActivity::class.java).apply {
+                action = Intent.ACTION_VIEW
+                data = appUri
             }
         }
 
@@ -60,8 +80,19 @@ class Game(
         result = 31 * result + regions.hashCode()
         result = 31 * result + path.hashCode()
         result = 31 * result + titleId.hashCode()
+        result = 31 * result + mediaType.hashCode()
         result = 31 * result + company.hashCode()
         return result
+    }
+
+    enum class MediaType(val value: Int) {
+        NAND(0),
+        SDMC(1),
+        GAME_CARD(2);
+
+        companion object {
+            fun fromInt(value: Int): MediaType? = MediaType.entries.find { it.value == value }
+        }
     }
 
     companion object {
@@ -72,7 +103,7 @@ class Game(
         )
 
         val badExtensions: Set<String> = HashSet(
-            listOf("rar", "zip", "7z", "torrent", "tar", "gz")
+            listOf("rar", "7z", "torrent", "tar", "gz")
         )
     }
 }

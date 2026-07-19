@@ -1,5 +1,3 @@
-//FILE MODIFIED BY AzaharPlus APRIL 2025
-
 // Copyright Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
@@ -124,49 +122,58 @@ enum SystemLanguage {
 enum SoundOutputMode { SOUND_MONO = 0, SOUND_STEREO = 1, SOUND_SURROUND = 2 };
 
 struct EULAVersion {
-    u8 minor;
-    u8 major;
+    u8 minor{};
+    u8 major{};
     INSERT_PADDING_BYTES(2);
 };
 static_assert(sizeof(EULAVersion) == 4, "EULAVersion must be exactly 0x4 bytes");
 
 struct UsernameBlock {
     /// Exactly 20 bytes long, padded with zeros at the end if necessary
-    std::array<char16_t, 10> username;
-    u32 zero;
-    u32 ng_word;
+    std::array<char16_t, 10> username{};
+    u32 zero{};
+    u32 ng_word{};
 };
 static_assert(sizeof(UsernameBlock) == 0x1C, "UsernameBlock must be exactly 0x1C bytes");
 
 struct BirthdayBlock {
-    u8 month; ///< The month of the birthday
-    u8 day;   ///< The day of the birthday
+    u8 month{}; ///< The month of the birthday
+    u8 day{};   ///< The day of the birthday
 };
 static_assert(sizeof(BirthdayBlock) == 2, "BirthdayBlock must be exactly 2 bytes");
 
 struct ConsoleModelInfo {
-    u8 model;                  ///< The console model (3DS, 2DS, etc)
-    std::array<u8, 3> unknown; ///< Unknown data
+    u8 model{};                  ///< The console model (3DS, 2DS, etc)
+    std::array<u8, 3> unknown{}; ///< Unknown data
 };
 static_assert(sizeof(ConsoleModelInfo) == 4, "ConsoleModelInfo must be exactly 4 bytes");
 
 struct ConsoleCountryInfo {
-    std::array<u8, 2> unknown; ///< Unknown data
-    u8 state_code;             ///< The state or province code.
-    u8 country_code;           ///< The country code of the console
+    std::array<u8, 2> unknown{}; ///< Unknown data
+    u8 state_code{};             ///< The state or province code.
+    u8 country_code{};           ///< The country code of the console
+
+    bool operator==(const ConsoleCountryInfo& other) const {
+        return unknown == other.unknown && state_code == other.state_code &&
+               country_code == other.country_code;
+    }
+
+    bool operator!=(const ConsoleCountryInfo& other) const {
+        return !(*this == other);
+    }
 };
 static_assert(sizeof(ConsoleCountryInfo) == 4, "ConsoleCountryInfo must be exactly 4 bytes");
 
 struct BacklightControls {
-    u8 power_saving_enabled; ///< Whether power saving mode is enabled.
-    u8 brightness_level;     ///< The configured brightness level.
+    u8 power_saving_enabled{}; ///< Whether power saving mode is enabled.
+    u8 brightness_level{};     ///< The configured brightness level.
 };
 static_assert(sizeof(BacklightControls) == 2, "BacklightControls must be exactly 2 bytes");
 
 struct New3dsBacklightControls {
-    std::array<u8, 4> unknown_1; ///< Unknown data
-    u8 auto_brightness_enabled;  ///< Whether auto brightness is enabled.
-    std::array<u8, 3> unknown_2; ///< Unknown data
+    std::array<u8, 4> unknown_1{}; ///< Unknown data
+    u8 auto_brightness_enabled{};  ///< Whether auto brightness is enabled.
+    std::array<u8, 3> unknown_2{}; ///< Unknown data
 };
 static_assert(sizeof(New3dsBacklightControls) == 8,
               "New3dsBacklightControls must be exactly 8 bytes");
@@ -182,28 +189,6 @@ enum class AccessFlag : u16 {
     Global = UserRead | SystemRead | SystemWrite,
 };
 DECLARE_ENUM_FLAG_OPERATORS(AccessFlag);
-
-struct SecureInfoA {
-    std::array<u8, 0x100> signature;
-    u8 region;
-    u8 unknown;
-    std::array<u8, 0xF> serial_number;
-};
-static_assert(sizeof(SecureInfoA) == 0x111);
-
-struct LocalFriendCodeSeedB {
-    std::array<u8, 0x100> signature;
-    u64 unknown;
-    u64 friend_code_seed;
-};
-static_assert(sizeof(LocalFriendCodeSeedB) == 0x110);
-
-enum class SecureDataLoadStatus {
-    Loaded,
-    NotFound,
-    Invalid,
-    IOError,
-};
 
 class Module final {
 public:
@@ -338,6 +323,8 @@ public:
          *      2 : 0 if the system is a Nintendo 2DS, 1 otherwise
          */
         void GetModelNintendo2DS(Kernel::HLERequestContext& ctx);
+
+        void TranslateCountryInfo(Kernel::HLERequestContext& ctx);
 
         /**
          * CFG::GetConfig service function
@@ -658,35 +645,6 @@ public:
      */
     void SaveMacAddress();
 
-    /**
-     * Invalidates the loaded secure data so that it is loaded again.
-     */
-    void InvalidateSecureData();
-    /**
-     * Loads the LocalFriendCodeSeed_B file from NAND.
-     * @returns LocalFriendCodeSeedBLoadStatus indicating the file load status.
-     */
-    SecureDataLoadStatus LoadSecureInfoAFile();
-
-    /**
-     * Loads the LocalFriendCodeSeed_B file from NAND.
-     * @returns LocalFriendCodeSeedBLoadStatus indicating the file load status.
-     */
-    SecureDataLoadStatus LoadLocalFriendCodeSeedBFile();
-
-    /**
-     * Gets the SecureInfo_A path in the host filesystem
-     * @returns std::string SecureInfo_A path in the host filesystem
-     */
-    std::string GetSecureInfoAPath();
-
-    /**
-     * Gets the LocalFriendCodeSeed_B path in the host filesystem
-     * @returns std::string LocalFriendCodeSeed_B path in the host filesystem
-     */
-    std::string GetLocalFriendCodeSeedBPath();
-
-
 private:
     void UpdatePreferredRegionCode();
     SystemLanguage GetRawSystemLanguage();
@@ -697,13 +655,11 @@ private:
     std::array<u8, CONFIG_SAVEFILE_SIZE> cfg_config_file_buffer;
     std::unique_ptr<FileSys::ArchiveBackend> cfg_system_save_data_archive;
     u32 preferred_region_code = 0;
-    bool secure_info_a_loaded = false;
-    SecureInfoA secure_info_a;
-    bool local_friend_code_seed_b_loaded = false;
-    LocalFriendCodeSeedB local_friend_code_seed_b;
     bool preferred_region_chosen = false;
     MCUData mcu_data{};
     std::string mac_address{};
+
+    Result load_savegame_res{ResultSuccess};
 
     std::shared_ptr<Network::ArticBase::Client> artic_client = nullptr;
 
@@ -715,6 +671,8 @@ private:
 std::shared_ptr<Module> GetModule(Core::System& system);
 
 void InstallInterfaces(Core::System& system);
+
+std::string GetUsername(Core::System& system);
 
 /// Convenience function for getting a SHA256 hash of the Console ID
 std::string GetConsoleIdHash(Core::System& system);
